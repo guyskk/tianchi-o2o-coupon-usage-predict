@@ -1,0 +1,5 @@
+data
+__pycache__
+dask-worker-space
+.ipynb_checkpoints/
+.DS_Store
