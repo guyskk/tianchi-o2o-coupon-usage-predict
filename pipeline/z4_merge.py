@@ -4,22 +4,25 @@ from z3_feature import NULL_DISTANCE
 from loguru import logger as LOG
 
 
-def read_features():
-    feature_names = [
-        'user', 'merchant', 'coupon',
-        'discount', 'distance', 'train', 'validate', 'test',
-    ]
+def read_features(num):
+    feature_names = ['user', 'merchant', 'coupon', 'discount', 'distance']
     features = {}
     for name in feature_names:
-        path = 'data/z3_feature_{}.msgpack'.format(name)
-        LOG.info('read {} -> {}', name, path)
+        path = 'data/z3_feature_{}_{}.msgpack'.format(name, num)
+        LOG.info('#{} read {} -> {}', num, name, path)
         df = pd.read_msgpack(path)
         features[name] = df
     return features
 
 
-def merge_feratures(features, target):
-    df = features[target]
+def read_label(num):
+    path = 'data/z3_feature_label_{}.msgpack'.format(num)
+    LOG.info('#{} read label -> {}', num, path)
+    return pd.read_msgpack(path)
+
+
+def merge_feratures(features, label):
+    df = label
 
     df_user = features['user']
     df = pd.merge(df, df_user, left_on='user_id', right_index=True, how='left')
@@ -53,13 +56,14 @@ def merge_feratures(features, target):
 
 
 def main():
-    features = read_features()
-    for target in ['train', 'validate', 'test']:
-        LOG.info('merge features for {}', target)
-        df, df_full = merge_feratures(features, target)
-        LOG.info('dataset {}: size={}, columns={}', target, len(df), len(df.columns))
-        df.to_msgpack('data/z4_merge_{}.msgpack'.format(target))
-        df_full.to_msgpack('data/z4_merge_{}_full.msgpack'.format(target))
+    for num in [1, 2, 3]:
+        LOG.info('merge features for dataset {}', num)
+        features = read_features(num)
+        label = read_label(num)
+        df, df_full = merge_feratures(features, label)
+        LOG.info('dataset {}: size={}, columns={}', num, len(df), len(df.columns))
+        df.to_msgpack('data/z4_merge_{}.msgpack'.format(num))
+        df_full.to_msgpack('data/z4_merge_{}_full.msgpack'.format(num))
 
 
 if __name__ == "__main__":

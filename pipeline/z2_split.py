@@ -1,16 +1,8 @@
-import os
 import pandas as pd
-import numpy as np
 from loguru import logger as LOG
 
-DATE_SPLIT = pd.to_datetime('2016-04-01')
 
-
-def get_split_type():
-    return os.getenv('SPLIT_TYPE', 'date')
-
-
-def split_label(df):
+def select_label(df, date_begin, date_end):
     columns = [
         'user_id',
         'merchant_id',
@@ -25,58 +17,46 @@ def split_label(df):
         'discount_rate',
         'label',
     ]
-    selection = (df['coupon_id'].notnull()
-                 & df['date_received'].notnull()
-                 & (df['date_received'] >= DATE_SPLIT))
+    selection = (
+        df['coupon_id'].notnull()
+        & df['date_received'].notnull()
+        & (df['date_received'] >= date_begin)
+        & (df['date_received'] <= date_end)
+    )
     df = df.loc[selection, columns]
-    if get_split_type() == 'date':
-        LOG.info('split label by date')
-        df_train = df[df['date_received'] < '2016-06-01']
-        df_validate = df[df['date_received'] >= '2016-06-01']
-    else:
-        LOG.info('split label by random')
-        mask = np.random.rand(len(df)) < 0.9
-        df_train = df[mask]
-        df_validate = df[~mask]
-    return df_train, df_validate
+    return df
 
 
-def select_data(df):
-    cond1 = cond2 = None
+def select_feature(df, date_begin, date_end):
+    cond1 = cond2 = True
     if 'date_received' in df.columns:
-        cond1 = df['date_received'].isnull() | (df['date_received'] < DATE_SPLIT)
+        col = df['date_received']
+        cond1 = col.isnull() | ((date_begin <= col) & (col <= date_end))
     if 'date' in df.columns:
-        cond2 = df['date'].isnull() | (df['date'] < DATE_SPLIT)
-    if cond1 is None:
-        if cond2 is None:
-            return df
-        else:
-            return df[cond2]
-    else:
-        if cond2 is None:
-            return df[cond1]
-        else:
-            return df[cond1 & cond2]
+        col = df['date']
+        cond2 = col.isnull() | ((date_begin <= col) & (col <= date_end))
+    return df[cond1 & cond2]
 
 
 def main():
     df = pd.read_msgpack(f'data/z1_raw_offline.msgpack')
-    df_train, df_validate = split_label(df)
-    LOG.info('dataset size: offline={}, train={}, validate={}',
-             len(df), len(df_train), len(df_validate))
-    df_train.to_msgpack(f'data/z2_split_train.msgpack')
-    df_validate.to_msgpack(f'data/z2_split_validate.msgpack')
+    df_label_1 = select_label(df, '2016-04-14', '2016-05-14')
+    df_label_2 = select_label(df, '2016-05-15', '2016-06-15')
+    LOG.info('label size: offline={}, label_1={}, label_2={}',
+             len(df), len(df_label_1), len(df_label_2))
+    df_label_1.to_msgpack(f'data/z2_split_label_1.msgpack')
+    df_label_2.to_msgpack(f'data/z2_split_label_2.msgpack')
 
-    df = select_data(df)
-    df.to_msgpack('data/z2_split_offline.msgpack')
-
-    df = pd.read_msgpack(f'data/z1_raw_online_click.msgpack')
-    df = select_data(df)
-    df.to_msgpack(f'data/z2_split_online_click.msgpack')
-
-    df = pd.read_msgpack(f'data/z1_raw_online_coupon.msgpack')
-    df = select_data(df)
-    df.to_msgpack(f'data/z2_split_online_coupon.msgpack')
+    for df_name in ['offline', 'online_click', 'online_coupon']:
+        df = pd.read_msgpack(f'data/z1_raw_{df_name}.msgpack')
+        df_feature_1 = select_feature(df, '2016-01-01', '2016-04-13')
+        df_feature_2 = select_feature(df, '2016-02-01', '2016-05-14')
+        df_feature_3 = select_feature(df, '2016-03-15', '2016-06-30')
+        LOG.info('{} feature size: all={}, feature_1={}, feature_2={}, feature_3={}',
+                 df_name, len(df), len(df_feature_1), len(df_feature_2), len(df_feature_3))
+        df_feature_1.to_msgpack(f'data/z2_split_{df_name}_feature_1.msgpack')
+        df_feature_2.to_msgpack(f'data/z2_split_{df_name}_feature_2.msgpack')
+        df_feature_3.to_msgpack(f'data/z2_split_{df_name}_feature_3.msgpack')
 
 
 if __name__ == '__main__':

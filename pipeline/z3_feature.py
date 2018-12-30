@@ -5,8 +5,8 @@ from loguru import logger as LOG
 from pandas_parallel import pandas_parallel, cloudpickle_safe_lru_cache
 
 
-SourceDatasets = namedtuple(
-    'SourceDataset', 'offline online_click online_coupon train validate test')
+FeatureDataset = namedtuple(
+    'FeatureDataset', 'offline online_click online_coupon')
 
 
 def most_freq(s):
@@ -404,15 +404,15 @@ def extract_user_feature_online_coupon(df, df_name):
     return df_result
 
 
-def extract_user_feature(datasets):
+def extract_user_feature(dataset):
     feature_dfs = []
-    df = datasets.offline
+    df = dataset.offline
     feature_dfs.append(extract_user_feature_offline(df, 'user_offline'))
     feature_dfs.append(compute_user_feature_is_active(df, 'user_offline'))
-    df = datasets.online_click
+    df = dataset.online_click
     feature_dfs.append(extract_user_feature_online_click(df, 'user_online_click'))
     feature_dfs.append(compute_user_feature_is_active(df, 'user_online_click'))
-    df = datasets.online_coupon
+    df = dataset.online_coupon
     feature_dfs.append(extract_user_feature_online_coupon(df, 'user_online_coupon'))
     feature_dfs.append(compute_user_feature_is_active(df, 'user_online_coupon'))
     df = pd.concat(feature_dfs, axis=1)
@@ -454,8 +454,8 @@ def extract_merchant_feature_offline(df, df_name):
     return df_result
 
 
-def extract_merchant_feature(datasets):
-    return extract_merchant_feature_offline(datasets.offline, 'merchant_offline')
+def extract_merchant_feature(dataset):
+    return extract_merchant_feature_offline(dataset.offline, 'merchant_offline')
 
 
 def extract_coupon_feature_offline(df, df_name):
@@ -473,8 +473,8 @@ def extract_coupon_feature_offline(df, df_name):
     return df_result
 
 
-def extract_coupon_feature(datasets):
-    return extract_coupon_feature_offline(datasets.offline, 'coupon_offline')
+def extract_coupon_feature(dataset):
+    return extract_coupon_feature_offline(dataset.offline, 'coupon_offline')
 
 
 def extract_distance_feature_offline(df, df_name):
@@ -492,70 +492,70 @@ def extract_distance_feature_offline(df, df_name):
     return df_result
 
 
-def extract_distance_feature(datasets):
-    return extract_distance_feature_offline(datasets.offline, 'distance_offline')
+def extract_distance_feature(dataset):
+    return extract_distance_feature_offline(dataset.offline, 'distance_offline')
 
 
-def extract_discount_feature(datasets):
-    df_offline = compute_discount_feature(datasets.offline, 'discount_offline')
-    df_online = compute_discount_feature(datasets.online_coupon, 'discount_online')
+def extract_discount_feature(dataset):
+    df_offline = compute_discount_feature(dataset.offline, 'discount_offline')
+    df_online = compute_discount_feature(dataset.online_coupon, 'discount_online')
     df = pd.concat([df_offline, df_online], axis=1, sort=False)
     return df
 
 
-def extract_train_feature(datasets):
-    return compute_predict_feature(datasets.train)
-
-
-def extract_validate_feature(datasets):
-    return compute_predict_feature(datasets.validate)
-
-
-def extract_test_feature(datasets):
-    return compute_predict_feature(datasets.test)
-
-
-def read_datasets():
+def read_feature_dataset(num):
     dataset_paths = {
-        'offline': 'data/z2_split_offline.msgpack',
-        'online_click': 'data/z2_split_online_click.msgpack',
-        'online_coupon': 'data/z2_split_online_coupon.msgpack',
-        'train': 'data/z2_split_train.msgpack',
-        'validate': 'data/z2_split_validate.msgpack',
-        'test': 'data/z1_raw_test.msgpack',
+        'offline': f'data/z2_split_offline_feature_{num}.msgpack',
+        'online_click': f'data/z2_split_online_click_feature_{num}.msgpack',
+        'online_coupon': f'data/z2_split_online_coupon_feature_{num}.msgpack',
     }
-    datasets = {}
+    dataset = {}
     for name, path in dataset_paths.items():
-        LOG.info('read dataset {} -> {}', name, path)
+        LOG.info('read dataset#{} {} -> {}', num, name, path)
         df = pd.read_msgpack(path)
         if 'distance' in df.columns:
             df['distance'].fillna(NULL_DISTANCE, inplace=True)
-        datasets[name] = df
-    datasets = SourceDatasets(**datasets)
-    return datasets
+        dataset[name] = df
+    dataset = FeatureDataset(**dataset)
+    return dataset
 
 
-def extract_features(datasets):
+def read_label_df(num):
+    path = f'data/z2_split_label_{num}.msgpack'
+    LOG.info('read label#{} -> {}', num, path)
+    return pd.read_msgpack(path)
+
+
+def extract_features(dataset, num):
     feature_extracts = {
         'user': extract_user_feature,
         'merchant': extract_merchant_feature,
         'coupon': extract_coupon_feature,
         'discount': extract_discount_feature,
         'distance': extract_distance_feature,
-        'train': extract_train_feature,
-        'validate': extract_validate_feature,
-        'test': extract_test_feature,
     }
     for name, extract in feature_extracts.items():
-        LOG.info('extract {} feature', name)
-        df = extract(datasets)
+        LOG.info('#{} extract {} feature', num, name)
+        df = extract(dataset)
         LOG.info('feature {}: size={}, columns={}', name, len(df), len(df.columns))
-        df.to_msgpack('data/z3_feature_{}.msgpack'.format(name))
+        df.to_msgpack('data/z3_feature_{}_{}.msgpack'.format(name, num))
+
+
+def extract_labels(df, num):
+    df = compute_predict_feature(df)
+    LOG.info('#{} label: size={}, columns={}', num, len(df), len(df.columns))
+    df.to_msgpack('data/z3_feature_label_{}.msgpack'.format(num))
 
 
 def main():
-    datasets = read_datasets()
-    extract_features(datasets)
+    for num in [1, 2, 3]:
+        dataset = read_feature_dataset(num)
+        extract_features(dataset, num)
+    for num in [1, 2]:
+        df = read_label_df(num)
+        extract_labels(df, num)
+    df = pd.read_msgpack('data/z1_raw_test.msgpack')
+    extract_labels(df, 3)
 
 
 if __name__ == "__main__":
