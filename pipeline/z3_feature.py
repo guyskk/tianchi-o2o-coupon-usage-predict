@@ -25,7 +25,7 @@ def flat_columns(df, format=None):
 def prefix_columns(df, prefix):
     if not prefix.endswith('_'):
         prefix = prefix + '_'
-    df.columns = [prefix + x for x in df.columns]
+    df.columns = [prefix + str(x) for x in df.columns]
 
 
 NULL_DISTANCE = 12
@@ -126,6 +126,25 @@ def apply_date_to_vec(df, column):
     return df_vec
 
 
+def _label_of(df):
+    return df['label'] if 'label' in df.columns else df['date'].notnull()
+
+
+def select_received_coupon(df):
+    label = _label_of(df)
+    return df[(~label) & df['date_received'].notnull() & df['coupon_id'].notnull()]
+
+
+def select_buy_with_coupon(df):
+    label = _label_of(df)
+    return df[label & df['date_received'].notnull() & df['coupon_id'].notnull()]
+
+
+def select_buy_without_coupon(df):
+    label = _label_of(df)
+    return df[(~label) & df['coupon_id'].isnull()]
+
+
 def compute_user_feature_is_active_by(df, date_column):
     # !!! Do NOT parallel
     df_last_date = df.groupby('user_id')[date_column].max()\
@@ -156,7 +175,7 @@ def compute_user_feature_merchant(df):
     df_merchant_value_stats = df.groupby('user_id')['merchant_id']\
         .value_counts()\
         .groupby('user_id')\
-        .agg(['max', 'mean', 'median', most_freq])
+        .agg(['max', 'mean', 'median', 'std', most_freq])
     prefix_columns(df_merchant_value_stats, 'merchant_value_count')
     return pd.concat([
         df_merchant_nunique,
@@ -172,7 +191,7 @@ def compute_feature_to_user(df, by):
     df_usage_stats = df.groupby(by)['user_id']\
         .value_counts()\
         .groupby(by)\
-        .agg(['min', 'max', 'median', 'mean', most_freq])
+        .agg(['min', 'max', 'median', 'mean', 'std', most_freq])
     prefix_columns(df_usage_stats, 'user_usage')
     return pd.concat([
         df_user_nunique,
@@ -198,6 +217,12 @@ def compute_distance_feature_to_user(df):
 
 
 def compute_feature_discount(df, by):
+    # LOG.info('coupon transfer rate')
+    df_received_coupon = select_received_coupon(df)
+    df_buy_with_coupon = select_buy_with_coupon(df)
+    received_count = df_buy_with_coupon.groupby(by)['coupon_id'].size()
+    used_count = df_received_coupon.groupby(by)['coupon_id'].size()
+    df_transfer_rate = (used_count / received_count).to_frame('transfer_rate')
     # LOG.info('coupon counts')
     g = df.groupby(by)['coupon_id']
     df_coupon_count = g.size().to_frame(f'coupon_count')
@@ -205,14 +230,14 @@ def compute_feature_discount(df, by):
     df_coupon_value_stats = df.groupby(by)['coupon_id']\
         .value_counts()\
         .groupby(by)\
-        .agg(['max', 'mean', 'median', most_freq])
+        .agg(['max', 'mean', 'median', 'std', most_freq])
     prefix_columns(df_coupon_value_stats, 'coupon_value_count')
     # LOG.info('discount stats')
     df_discount_stats = df.groupby(by)\
         .agg({
-            'discount_man': ['max', 'min', 'median', 'mean', most_freq],
-            'discount_jian': ['max', 'min', 'median', 'mean', most_freq],
-            'discount_rate': ['max', 'min', 'median', 'mean', most_freq],
+            'discount_man': ['max', 'min', 'median', 'mean', 'std', most_freq],
+            'discount_jian': ['max', 'min', 'median', 'mean', 'std', most_freq],
+            'discount_rate': ['max', 'min', 'median', 'mean', 'std', most_freq],
         })
     flat_columns(df_discount_stats)
     # LOG.info('discount type counts')
@@ -225,6 +250,7 @@ def compute_feature_discount(df, by):
                 .size().to_frame(f'{discount_type}_count')
             df_discount_type_counts.append(df_sub)
     return pd.concat([
+        df_transfer_rate,
         df_coupon_count,
         df_coupon_nunique,
         df_coupon_value_stats,
@@ -243,7 +269,7 @@ def compute_merchant_feature_coupon(df):
 
 def compute_feature_distance(df, by):
     df_feature = df.groupby(by)['distance']\
-        .agg(['max', 'min', 'median', 'mean', most_freq])
+        .agg(['max', 'min', 'median', 'mean', 'std', most_freq])
     prefix_columns(df_feature, 'distance')
     return df_feature
 
@@ -278,7 +304,7 @@ def compute_feature_discount_hold_days(df, by):
         .to_frame('coupon_hold_days')
     df = pd.concat([df, df_coupon_hold_days], axis=1)
     df_feature = df.groupby(by)['coupon_hold_days']\
-        .agg(['max', 'min', 'median', 'mean', most_freq])
+        .agg(['max', 'min', 'median', 'mean', 'std', most_freq])
     prefix_columns(df_feature, 'coupon_hold_days')
     return df_feature
 
@@ -299,8 +325,8 @@ def compute_merchant_feature_coupon_hold_days(df):
 
 def compute_discount_feature(df, df_name):
     dfs = {
-        'received_coupon': df[df.date.isnull() & df.coupon_id.notnull()],
-        'buy_with_coupon': df[df.date.notnull() & df.coupon_id.notnull()],
+        'received_coupon': select_received_coupon(df),
+        'buy_with_coupon': select_buy_with_coupon(df),
     }
     feature_dfs = []
     for name, df_sub in dfs.items():
@@ -321,36 +347,15 @@ def compute_predict_feature(df):
 
 @pandas_parallel(partitioner='hash', partition_column='user_id', progress_bar=True)
 def extract_user_feature_offline(df, df_name):
-    dfs = {
-        'received_coupon': df[df.date.isnull() & df.coupon_id.notnull()],
-        'buy_with_coupon': df[df.date.notnull() & df.coupon_id.notnull()],
-        'buy_without_coupon': df[df.date.notnull() & df.coupon_id.isnull()],
-    }
-    df_received_coupon = dfs['received_coupon']
-    df_buy_with_coupon = dfs['buy_with_coupon']
-    df_buy_without_coupon = dfs['buy_without_coupon']
-    feature_dfs = [
-        ('received_coupon', compute_user_feature_coupon(df_received_coupon)),
-        ('buy_with_coupon', compute_user_feature_coupon(df_buy_with_coupon)),
-        ('buy_with_coupon', compute_user_feature_coupon_hold_days(df_buy_with_coupon)),
-        ('received_coupon', compute_user_feature_date(df_received_coupon, 'date_received')),
-        ('buy_with_coupon', compute_user_feature_date(df_buy_with_coupon, 'date_received')),
-        ('buy_with_coupon', compute_user_feature_date(df_buy_with_coupon, 'date')),
-        ('buy_without_coupon', compute_user_feature_date(df_buy_without_coupon, 'date')),
-        ('buy_with_coupon', compute_user_feature_distance(df_buy_with_coupon)),
-        ('buy_without_coupon', compute_user_feature_distance(df_buy_without_coupon)),
-        ('received_coupon', compute_user_feature_merchant(df_received_coupon)),
-        ('buy_with_coupon', compute_user_feature_merchant(df_buy_with_coupon)),
-        ('buy_without_coupon', compute_user_feature_merchant(df_buy_without_coupon)),
+    results = [
+        compute_user_feature_coupon(df),
+        compute_user_feature_coupon_hold_days(df),
+        compute_user_feature_date(df, 'date_received'),
+        compute_user_feature_date(df, 'date'),
+        compute_user_feature_distance(df),
+        compute_user_feature_merchant(df),
     ]
-    results = []
-    for prefix, df_feat in feature_dfs:
-        prefix_columns(df_feat, prefix)
-        results.append(df_feat)
     df_result = pd.concat(results, axis=1)
-    df_transfer_rate = compute_transfer_rate(
-        df_result, 'received_coupon_coupon_count', 'buy_with_coupon_coupon_count')
-    df_result = pd.concat([df_result, df_transfer_rate], axis=1)
     prefix_columns(df_result, df_name)
     return df_result
 
@@ -372,34 +377,14 @@ def extract_user_feature_online_click(df, df_name):
 
 @pandas_parallel(partitioner='hash', partition_column='user_id', progress_bar=True)
 def extract_user_feature_online_coupon(df, df_name):
-    dfs = {
-        'received_coupon': df[df.date.isnull() & df.coupon_id.notnull()],
-        'buy_with_coupon': df[df.date.notnull() & df.coupon_id.notnull()],
-        'buy_without_coupon': df[df.date.notnull() & df.coupon_id.isnull()],
-    }
-    df_received_coupon = dfs['received_coupon']
-    df_buy_with_coupon = dfs['buy_with_coupon']
-    df_buy_without_coupon = dfs['buy_without_coupon']
-    feature_dfs = [
-        ('received_coupon', compute_user_feature_coupon(df_received_coupon)),
-        ('buy_with_coupon', compute_user_feature_coupon(df_buy_with_coupon)),
-        ('buy_with_coupon', compute_user_feature_coupon_hold_days(df_buy_with_coupon)),
-        ('received_coupon', compute_user_feature_date(df_received_coupon, 'date_received')),
-        ('buy_with_coupon', compute_user_feature_date(df_buy_with_coupon, 'date_received')),
-        ('buy_with_coupon', compute_user_feature_date(df_buy_with_coupon, 'date')),
-        ('buy_without_coupon', compute_user_feature_date(df_buy_without_coupon, 'date')),
-        ('received_coupon', compute_user_feature_merchant(df_received_coupon)),
-        ('buy_with_coupon', compute_user_feature_merchant(df_buy_with_coupon)),
-        ('buy_without_coupon', compute_user_feature_merchant(df_buy_without_coupon)),
+    results = [
+        compute_user_feature_coupon(df),
+        compute_user_feature_coupon_hold_days(df),
+        compute_user_feature_date(df, 'date_received'),
+        compute_user_feature_date(df, 'date'),
+        compute_user_feature_merchant(df),
     ]
-    results = []
-    for prefix, df_feat in feature_dfs:
-        prefix_columns(df_feat, prefix)
-        results.append(df_feat)
     df_result = pd.concat(results, axis=1)
-    df_transfer_rate = compute_transfer_rate(
-        df_result, 'received_coupon_coupon_count', 'buy_with_coupon_coupon_count')
-    df_result = pd.concat([df_result, df_transfer_rate], axis=1)
     prefix_columns(df_result, df_name)
     return df_result
 
@@ -420,14 +405,9 @@ def extract_user_feature(dataset):
 
 
 def extract_merchant_feature_offline(df, df_name):
-    dfs = {
-        'received_coupon': df[df.date.isnull() & df.coupon_id.notnull()],
-        'buy_with_coupon': df[df.date.notnull() & df.coupon_id.notnull()],
-        'buy_without_coupon': df[df.date.notnull() & df.coupon_id.isnull()],
-    }
-    df_received_coupon = dfs['received_coupon']
-    df_buy_with_coupon = dfs['buy_with_coupon']
-    df_buy_without_coupon = dfs['buy_without_coupon']
+    df_received_coupon = select_received_coupon(df)
+    df_buy_with_coupon = select_buy_with_coupon(df)
+    df_buy_without_coupon = select_buy_without_coupon(df)
     feature_dfs = [
         ('received_coupon', compute_merchant_feature_coupon(df_received_coupon)),
         ('buy_with_coupon', compute_merchant_feature_coupon(df_buy_with_coupon)),
@@ -460,8 +440,8 @@ def extract_merchant_feature(dataset):
 
 def extract_coupon_feature_offline(df, df_name):
     dfs = {
-        'received_coupon': df[df.date.isnull() & df.coupon_id.notnull()],
-        'buy_with_coupon': df[df.date.notnull() & df.coupon_id.notnull()],
+        'received_coupon': select_received_coupon(df),
+        'buy_with_coupon': select_buy_with_coupon(df),
     }
     feature_dfs = []
     for name, df_sub in dfs.items():
@@ -479,8 +459,8 @@ def extract_coupon_feature(dataset):
 
 def extract_distance_feature_offline(df, df_name):
     dfs = {
-        'received_coupon': df[df.date.isnull() & df.coupon_id.notnull()],
-        'buy_with_coupon': df[df.date.notnull() & df.coupon_id.notnull()],
+        'received_coupon': select_received_coupon(df),
+        'buy_with_coupon': select_buy_with_coupon(df),
     }
     feature_dfs = []
     for name, df_sub in dfs.items():
@@ -542,7 +522,7 @@ def extract_features(dataset, num):
 
 
 def extract_labels(df, num):
-    df = compute_predict_feature(df)
+    df = compute_predict_feature(df).reset_index(drop=True)
     LOG.info('#{} label: size={}, columns={}', num, len(df), len(df.columns))
     df.to_msgpack('data/z3_feature_label_{}.msgpack'.format(num))
 

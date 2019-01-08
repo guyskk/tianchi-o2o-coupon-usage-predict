@@ -28,7 +28,9 @@ def parse_discount_rate(discount_rate):
         man = 0
         jian = np.nan
         rate = float(infos[0])
-        name = str(int(rate*100))
+        if rate > 1.0:
+            rate = rate / 100
+        name = str(int(rate * 100))
         return [name, False, True, False, man, jian, rate]
 
 
