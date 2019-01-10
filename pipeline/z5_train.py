@@ -130,28 +130,50 @@ def read_dataset():
 
 def read_dataset_ts():
     df_test = pd.read_msgpack('data/z6_ts_merged_test.msgpack')
+    df_test_full = pd.read_msgpack('data/z6_ts_merged_test_full.msgpack')
     features = list(df_test.columns.difference(['date']))
     df_test = df_test[features]
+    df_submit = df_test_full[['user_id', 'coupon_id', 'date']].copy()
+    df_submit['date'] = df_submit.date.dt.strftime('%Y%m%d')
     LOG.info('df_test {}', df_test.shape)
+    LOG.info('df_submit {}', df_submit.shape)
 
     df_train = pd.read_msgpack('data/z6_ts_merged_train.msgpack')
-    df_validate = df_train.loc[df_train['date'] > '2016-05-15', features + ['label']]
-    df_train = df_train.loc[df_train['date'] <= '2016-05-15', features + ['label']]
+    df_train_full = pd.read_msgpack('data/z6_ts_merged_train_full.msgpack')
+    df_validate = df_train.loc[(df_train['date'] >= '2016-05-01') &
+                               (df_train['date'] < '2016-06-01'), features + ['label']]
+    df_train = df_train.loc[df_train['date'] <= '2016-06-15', features + ['label']]
+    df_validate_submit = df_train_full.loc[
+        (df_train_full['date'] >= '2016-05-01') & (df_train_full['date'] < '2016-06-01'), [
+            'user_id', 'coupon_id', 'date', 'label'
+        ]].copy()
+    df_train_submit = df_train_full.loc[
+        (df_train_full['date'] <= '2016-06-15'), [
+            'user_id', 'coupon_id', 'date', 'label'
+        ]].copy()
+    df_validate_submit['date'] = df_validate_submit.date.dt.strftime('%Y%m%d')
+    df_train_submit['date'] = df_train_submit.date.dt.strftime('%Y%m%d')
     LOG.info('df_train {}', df_train.shape)
+    LOG.info('df_train_submit {}', df_train_submit.shape)
     LOG.info('df_validate {}', df_validate.shape)
-
-    df_raw_test = pd.read_msgpack('data/z1_raw_test.msgpack')
-    df_submit = df_raw_test[['user_id', 'coupon_id', 'date_received']].copy()
-    df_submit['date_received'] = df_submit.date_received.dt.strftime('%Y%m%d')
-    LOG.info('df_submit {}', df_submit.shape)
+    LOG.info('df_validate_submit {}', df_validate_submit.shape)
 
     df_train_x, df_train_y = split_feature_label(df_train)
     df_validate_x, df_validate_y = split_feature_label(df_validate)
 
-    return df_train_x, df_train_y, df_validate_x, df_validate_y, df_test, df_submit
+    return df_train_x, df_train_y, df_validate_x, df_validate_y, df_test, df_submit, df_validate_submit, df_train_submit
 
 
-df_train_x_best, df_train_y, df_validate_x_best, df_validate_y, df_test_x_best, df_submit = read_dataset_ts()
+(
+    df_train_x_best,
+    df_train_y,
+    df_validate_x_best,
+    df_validate_y,
+    df_test_x_best,
+    df_submit,
+    df_validate_submit,
+    df_train_submit,
+) = read_dataset_ts()
 SUBMIT_NAME = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
 
 
@@ -179,7 +201,9 @@ def lgb_predict():
     model.save_model(f'data/model-lgb-{SUBMIT_NAME}.dat')
 
     test_label = model.predict(df_test_x_best)
-    return test_label
+    validate_label = model.predict(df_validate_x_best)
+    train_label = model.predict(df_train_x_best)
+    return test_label, validate_label, train_label
 
 
 def xgb_predict():
@@ -212,23 +236,44 @@ def xgb_predict():
     model.save_model(f'data/model-xgb-{SUBMIT_NAME}.dat')
 
     predict_label = model.predict(dataset_test)
-    return predict_label
+    validate_label = model.predict(dataset_validate)
+    train_label = model.predict(dataset_train)
+    return predict_label, validate_label, train_label
 
 
 def main():
     use_xgb = len(sys.argv) >= 2 and sys.argv[1] == 'xgb'
     if use_xgb:
         submit_path = f'data/submit-xgb-{SUBMIT_NAME}.csv'
-        test_label = xgb_predict()
+        validate_submit_path = f'data/submit-xgb-validate-{SUBMIT_NAME}.csv'
+        train_submit_path = f'data/submit-xgb-train-{SUBMIT_NAME}.csv'
+        test_label, validate_label, train_label = xgb_predict()
     else:
         submit_path = f'data/submit-lgb-{SUBMIT_NAME}.csv'
-        test_label = lgb_predict()
+        validate_submit_path = f'data/submit-lgb-validate-{SUBMIT_NAME}.csv'
+        train_submit_path = f'data/submit-lgb-train-{SUBMIT_NAME}.csv'
+        test_label, validate_label, train_label = lgb_predict()
+
     test_label_prob = MinMaxScaler()\
         .fit_transform(test_label.reshape(-1, 1))\
         .reshape(-1)
     df_submit['prob'] = test_label_prob
     LOG.info('save result {}', submit_path)
     df_submit.to_csv(submit_path, index=False, header=False)
+
+    validate_label_prob = MinMaxScaler()\
+        .fit_transform(validate_label.reshape(-1, 1))\
+        .reshape(-1)
+    df_validate_submit['prob'] = validate_label_prob
+    LOG.info('save validate result {}', validate_submit_path)
+    df_validate_submit.to_csv(validate_submit_path, index=False, header=False)
+
+    train_label_prob = MinMaxScaler()\
+        .fit_transform(train_label.reshape(-1, 1))\
+        .reshape(-1)
+    df_train_submit['prob'] = train_label_prob
+    LOG.info('save train result {}', train_submit_path)
+    df_train_submit.to_csv(train_submit_path, index=False, header=False)
 
 
 if __name__ == "__main__":

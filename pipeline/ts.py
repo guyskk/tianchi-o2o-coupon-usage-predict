@@ -331,11 +331,11 @@ class EventsSnapshot:
 
     @cached_property
     def history(self):
-        return self.df.loc[:self.recent_begin]
+        return self.df.loc[:self.recent_begin].copy()
 
     @cached_property
     def recent(self):
-        return self.df.loc[self.recent_begin:self.recent_end]
+        return self.df.loc[self.recent_begin:self.recent_end].copy()
 
     @cached_property
     def recent_offline(self):
@@ -463,7 +463,7 @@ class BaseFeature:
     def process(self):
         result = []
         for key in tqdm.tqdm(self.keys, desc=self.name):
-            df_sub = self.get_value(key)
+            df_sub = self.get_value(key).copy()
             for date, recent_begin, recent_end in self.date_span_of(df_sub):
                 snapshot = EventsSnapshot(df_sub, date, recent_begin, recent_end)
                 if self.is_multikey:
