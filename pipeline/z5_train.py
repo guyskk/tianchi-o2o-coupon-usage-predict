@@ -39,6 +39,11 @@ def get_num_features(total):
     return num
 
 
+def with_date_feature(df):
+    df['date_dayofweek'] = df['date'].dt.dayofweek
+    df['date_dayofmonth'] = df['date'].dt.day
+
+
 def select_best_features(df_x, df_y):
     select = VarianceThreshold(0.01)
     select.fit(df_x.values, df_y.values)
@@ -130,8 +135,10 @@ def read_dataset():
 
 def read_dataset_ts():
     df_test = pd.read_msgpack('data/z6_ts_merged_test.msgpack')
+    with_date_feature(df_test)
     df_test_full = pd.read_msgpack('data/z6_ts_merged_test_full.msgpack')
     features = list(df_test.columns.difference(['date']))
+    print(pretty(features))
     df_test = df_test[features]
     df_submit = df_test_full[['user_id', 'coupon_id', 'date']].copy()
     df_submit['date'] = df_submit.date.dt.strftime('%Y%m%d')
@@ -139,16 +146,17 @@ def read_dataset_ts():
     LOG.info('df_submit {}', df_submit.shape)
 
     df_train = pd.read_msgpack('data/z6_ts_merged_train.msgpack')
+    with_date_feature(df_train)
     df_train_full = pd.read_msgpack('data/z6_ts_merged_train_full.msgpack')
     df_validate = df_train.loc[(df_train['date'] >= '2016-05-01') &
                                (df_train['date'] < '2016-06-01'), features + ['label']]
-    df_train = df_train.loc[df_train['date'] <= '2016-06-15', features + ['label']]
+    df_train = df_train.loc[df_train['date'] < '2016-06-01', features + ['label']]
     df_validate_submit = df_train_full.loc[
         (df_train_full['date'] >= '2016-05-01') & (df_train_full['date'] < '2016-06-01'), [
             'user_id', 'coupon_id', 'date', 'label'
         ]].copy()
     df_train_submit = df_train_full.loc[
-        (df_train_full['date'] <= '2016-06-15'), [
+        (df_train_full['date'] < '2016-06-01'), [
             'user_id', 'coupon_id', 'date', 'label'
         ]].copy()
     df_validate_submit['date'] = df_validate_submit.date.dt.strftime('%Y%m%d')
@@ -187,7 +195,7 @@ def lgb_predict():
         'lambda_l1': 1,
         'lambda_l2': 10,
         'eta': 0.01,
-        'num_threads': 7,
+        'num_threads': 6,
     }
     dataset_train = lgb.Dataset(df_train_x_best, label=df_train_y)
     dataset_validate = lgb.Dataset(df_validate_x_best, label=df_validate_y)
@@ -221,7 +229,7 @@ def xgb_predict():
         'eta': 0.01,
         'tree_method': 'exact',
         'seed': 0,
-        'nthread': 8,
+        'nthread': 4,
         'verbosity': 0,
     }
     dataset_train = xgb.DMatrix(df_train_x_best, label=df_train_y)
