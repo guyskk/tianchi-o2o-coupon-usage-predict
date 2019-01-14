@@ -1024,16 +1024,21 @@ class MergedFeature:
 
 
 def build_date_ranges():
-    d = pd.date_range('2016-01-01', '2016-07-31', freq='D')
-    ret = {'date': d}
-    ret['yesterday'] = d - pd.Timedelta(days=1)
-    ret['future_begin'] = d + pd.Timedelta(days=1)
-    ret['future_end'] = d + pd.Timedelta(days=15)
-    ret['recent_end'] = d - pd.Timedelta(days=15)
-    ret['recent_begin'] = d - pd.Timedelta(days=74)
-    ret['history_end'] = d - pd.Timedelta(days=75)
-    df = pd.DataFrame(ret).set_index('date')
-    return dict([(k, tuple(v)) for k, v in df.iterrows()])
+    d = np.arange(366)
+    yesterday = np.clip(d - 1, 0, 365)
+    future_begin = np.clip(d + 1, 0, 365)
+    future_end = np.clip(d + 15, 0, 365)
+    recent_end = np.clip(d - 15, 0, 365)
+    recent_begin = np.clip(d - 74, 0, 365)
+    history_end = np.clip(d - 75, 0, 365)
+    return list(zip(
+        yesterday,
+        future_begin,
+        future_end,
+        recent_end,
+        recent_begin,
+        history_end,
+    ))
 
 
 DATE_RANGES = build_date_ranges()
@@ -1075,60 +1080,119 @@ class TestMerchantFeature:
 
     @profile
     def process(self):
-        df = self.df_events.set_index(['merchant_id', 'date']).sort_index()
-        df = with_discount(df, self.df_discount)
-        keys = df.index.get_level_values('merchant_id').unique()
+        df = with_discount(self.df_events, self.df_discount)
+        df['is_offline'] = df['event_type'].isin((
+            'offline_receive_coupon',
+            'offline_buy_with_coupon',
+            'offline_buy_without_coupon',
+        ))
+        df['is_coupon'] = df['event_type'].isin((
+            'offline_receive_coupon',
+            'online_receive_coupon',
+            'offline_buy_with_coupon',
+            'online_buy_with_coupon',
+        ))
+        df['is_buy'] = df['event_type'].isin((
+            'offline_buy_with_coupon',
+            'online_buy_with_coupon',
+        ))
+        df['is_offline_receive_coupon'] = df['is_offline'] & df['is_coupon'] & (~df['is_buy'])
+        df['is_offline_buy_with_coupon'] = df['is_offline'] & df['is_coupon'] & (df['is_buy'])
+        df['is_offline_buy_without_coupon'] = df['is_offline'] & (~df['is_coupon']) & df['is_buy']
+        df['is_online_receive_coupon'] = (~df['is_offline']) & df['is_coupon'] & (~df['is_buy'])
+        df['is_online_buy_with_coupon'] = (~df['is_offline']) & df['is_coupon'] & (df['is_buy'])
+        df['is_online_buy_without_coupon'] = (~df['is_offline']) & (~df['is_coupon']) & df['is_buy']
+        df['is_online_receive_coupon'] = (~df['is_offline']) & (~df['is_coupon']) & (~df['is_buy'])
+        df['t'] = df['date'].dt.dayofyear - 1
+        df['t2'] = df['date2'].dt.dayofyear - 1
+        events = IndexedEvents(df)
         result = []
-        for key in tqdm.tqdm(keys):
-            df_sub = df.loc[key]
-            idx_date = df_sub.index.get_level_values('date').unique()
-            for date in idx_date:
-                row = self.process_snapshot(key, date, df_sub)
-                result.append([key, date, *row])
+        for key in tqdm.tqdm(self.keys):
+            sub_events = events.loc(key)
+            idx_date = np.unique(sub_events['t'])
+            for t in idx_date:
+                row = self.process_snapshot(key, t, events)
+                result.append([key, t, *row])
         df_result = pd.DataFrame.from_records(result, columns=self.COLUMNS)
         return df_result
 
     @profile
-    def process_snapshot(self, merchant_id, date, df_events):
-        yesterday, future_begin, future_end, recent_end, recent_begin, history_end = DATE_RANGES[date]
-        # df_today = df_events.loc[date:date]
-        df_yesterday = df_events.loc[yesterday:yesterday]
-        # df_future = df_events.loc[future_begin:future_end]
-        df_recent = df_events.loc[recent_begin:recent_end]
-        # df_history = df_events.loc[:history_end]
+    def process_snapshot(self, key, t, events):
+        yesterday, future_begin, future_end, recent_end, recent_begin, history_end = DATE_RANGES[t]
+        df_yesterday = events.loc(key, yesterday, yesterday)
+        df_recent = events.loc(key, recent_begin, recent_end)
+        df_yesterday_receive_coupon = df_yesterday[
+            df_yesterday['is_offline_receive_coupon']
+        ]
+        df_yesterday_buy_without_coupon = df_yesterday[
+            df_yesterday['is_offline_buy_without_coupon']
+        ]
+        df_recent_receive_coupon = df_recent[
+            df_recent['is_offline_receive_coupon']
+        ]
+        df_recent_buy_with_coupon = df_recent[
+            df_recent['is_offline_buy_with_coupon']
+        ]
+        df_recent_buy_without_coupon = df_recent[
+            df_recent['is_offline_buy_without_coupon']
+        ]
         # 昨日领券数
-        yesterday_offline_receive_coupon_count = 0
-        yesterday_offline_buy_without_coupon_count = 0
+        yesterday_offline_receive_coupon_count = len(df_yesterday_receive_coupon)
+        yesterday_offline_buy_without_coupon_count = len(df_yesterday_buy_without_coupon)
         # 商家优惠券被领取次数
-        recent_receive_coupon_count = 0
+        recent_receive_coupon_count = len(df_recent_receive_coupon)
         # 无券购买次数
-        recent_buy_without_coupon_count = 0
-        recent_buy_without_coupon_nunique = 0
+        recent_buy_without_coupon_count = len(df_recent_buy_without_coupon)
+        recent_buy_without_coupon_nunique = len(
+            np.unique(df_recent_buy_without_coupon['user_id']))
         # 商家优惠券被领取后核销次数
-        recent_buy_with_coupon_count = 0
+        recent_buy_with_coupon_count = len(df_recent_buy_with_coupon)
         # 商家优惠券被领取后不核销次数
-        recent_not_buy_coupon_count = 0
+        recent_not_buy_coupon_count = recent_receive_coupon_count - recent_buy_with_coupon_count
         # 商家优惠券核销的平均/最小/最大消费折率
-        buy_with_coupon_coupon_mean = 0
-        buy_with_coupon_coupon_min = 0
-        buy_with_coupon_coupon_max = 0
+        df_discount_rate = df_recent_buy_with_coupon['discount_rate']
+        if len(df_discount_rate) > 0:
+            buy_with_coupon_coupon_mean = np.mean(df_discount_rate)
+            buy_with_coupon_coupon_min = np.mean(df_discount_rate)
+            buy_with_coupon_coupon_max = np.mean(df_discount_rate)
+        else:
+            buy_with_coupon_coupon_mean = 0
+            buy_with_coupon_coupon_min = 0
+            buy_with_coupon_coupon_max = 0
         # 核销商家优惠券的不同用户数量，及其占领取不同的用户比重
-        buy_with_coupon_user_nunique = 0
-        receive_coupon_user_nunique = 0
+        buy_with_coupon_user_nunique = len(
+            np.unique(df_recent_buy_with_coupon['user_id']))
+        receive_coupon_user_nunique = len(np.unique(df_recent_receive_coupon['user_id']))
         # 商家优惠券平均每个用户核销多少张
-        buy_with_coupon_mean_per_user = 0
+        buy_with_coupon_mean_per_user = divide_zero(
+            recent_buy_with_coupon_count,
+            len(np.unique(df_recent['user_id'])))
         # 商家被核销过的不同优惠券数量
-        buy_with_coupon_coupon_nunique = 0
+        coupon_nunique = len(np.unique(df_recent['coupon_id']))
+        buy_with_coupon_coupon_nunique = len(
+            np.unique(df_recent_buy_with_coupon['coupon_id']))
         # 商家被核销过的不同优惠券数量占所有领取过的不同优惠券数量的比重
-        receive_coupon_coupon_nunique = 0
+        receive_coupon_coupon_nunique = divide_zero(buy_with_coupon_coupon_nunique, coupon_nunique)
         # 商家平均每种优惠券核销多少张
-        buy_with_coupon_mean_per_coupon = 0
+        buy_with_coupon_mean_per_coupon = divide_zero(
+            recent_buy_with_coupon_count,
+            len(np.unique(df_recent['coupon_id'])))
         # 商家被核销优惠券的平均时间率
-        buy_with_coupon_mean_days = 0
+        df_days = df_recent_buy_with_coupon['t'] - df_recent_buy_with_coupon['t2']
+        if len(df_days) > 0:
+            buy_with_coupon_mean_days = np.mean(df_days)
+        else:
+            buy_with_coupon_mean_days = 0
         # 商家被核销优惠券中的平均/最小/最大用户-商家距离
-        buy_with_coupon_distance_mean = 0
-        buy_with_coupon_distance_min = 0
-        buy_with_coupon_distance_max = 0
+        df_distance = df_recent_buy_with_coupon['distance']
+        if len(df_distance) > 0:
+            buy_with_coupon_distance_mean = np.mean(df_distance)
+            buy_with_coupon_distance_min = np.min(df_distance)
+            buy_with_coupon_distance_max = np.max(df_distance)
+        else:
+            buy_with_coupon_distance_mean = 0
+            buy_with_coupon_distance_min = 0
+            buy_with_coupon_distance_max = 0
         # 商家优惠券被领取后核销率
         recent_buy_with_coupon_rate = divide_zero(
             recent_buy_with_coupon_count, recent_receive_coupon_count)
@@ -1255,19 +1319,56 @@ class TestMerchantFeature:
         df.to_msgpack('data/z6_ts_feature_merchant.msgpack')
 
 
+class IndexedColumn:
+    """IndexedColumn"""
+
+
 class IndexedEvents:
     def __init__(self, df_events):
-        df_events = df_events.sort_values(['merchant_id', 'date', 'event_type'])
+        # df_events = df_events.head(100)
+        with TLOG('sort_values'):
+            df_events = df_events.sort_values(['merchant_id', 'date', 'event_type'])
         self.df_events = df_events
-        self._data = df_events.values
+
+        self.c = IndexedColumn()
+        for i, name in enumerate(df_events.columns):
+            setattr(self.c, name, i)
+
+        with TLOG('df_index'):
+            df_index = pd.DataFrame({
+                'merchant_id': df_events['merchant_id'],
+                't': df_events['date'].dt.dayofyear - 1
+            }).copy()
+
+        dtype = self._get_np_dtype(df_events)
+        dtype_dict = dict(dtype)
+
+        with TLOG('convert date'):
+            columns = []
+            for name in df_events.columns:
+                v = np.array(df_events[name].values, dtype=dtype_dict[name])
+                columns.append(v)
+        with TLOG('np.array dtype'):
+            self._data = np.array(list(zip(*columns)), dtype=dtype)
+
         self._index = {}
         with TLOG('_build_index'):
-            self._build_index()
+            self._build_index(df_index[['merchant_id', 't']])
 
-    def _build_index(self):
-        df = self.df_events.copy()
-        df['t'] = df['date'].dt.dayofyear - 1
-        df = df[['merchant_id', 't']]
+    def _get_np_dtype(self, df):
+        np_dtype = []
+        for k, v in df.dtypes.items():
+            if v == np.object:
+                v = np.str
+            else:
+                try:
+                    v = np.dtype(v)
+                except TypeError:
+                    v = np.str
+            np_dtype.append((k, v))
+        return np_dtype
+
+    def _build_index(self, df):
         prev_key = None
         prev_t = 0
         for i, (key, t) in tqdm.tqdm(enumerate(df.values), total=len(df)):
@@ -1298,12 +1399,12 @@ class IndexedEvents:
             prev_idx[prev_t, 1] = i - 1
             prev_idx[prev_t+1:, 0] = i - 1
 
-    def loc(self, key, t1, t2):
-        if not isinstance(t1, int):
-            t1 = pd.Timestamp(t1).dayofyear - 1
-        if not isinstance(t2, int):
-            t2 = pd.Timestamp(t2).dayofyear - 1
+    def loc(self, key, t1=None, t2=None):
         idx = self._index[key]
+        if t1 is None:
+            t1 = 0
+        if t2 is None:
+            t2 = 365
         i1, j1 = idx[t1]
         i2, j2 = idx[t2]
         if j1 == -1:
@@ -1311,20 +1412,22 @@ class IndexedEvents:
         else:
             i = i1
         if j2 == -1:
-            j = i2
+            j = i2 + 1
         else:
-            j = j2
-        return self._data[i:j+1]
+            j = j2 + 1
+        return self._data[i:j]
 
 
 if __name__ == "__main__":
     # O2OEvents.main()
-    # TestMerchantFeature.main()
+    TestMerchantFeature.main()
     # CouponFeature.main()
     # UserFeature.main()
     # UserMerchantFeature.main()
     # MergedFeature.main()
-    with TLOG('read events'):
-        df_events = pd.read_msgpack('data/z6_ts_events.msgpack')
-    ti = IndexedEvents(df_events)
-    print(ti.loc(1159, '2016-04-20', '2016-04-22'))
+    # with TLOG('read events'):
+    #     df_events = pd.read_msgpack('data/z6_ts_events.msgpack')
+    # ti = IndexedEvents(df_events)
+    # t1 = pd.Timestamp('2016-04-20').dayofyear
+    # t2 = pd.Timestamp('2016-04-22').dayofyear
+    # print(ti.loc(1159, t1, t2))
