@@ -1,4 +1,3 @@
-import math
 """
 User(user_id):
     offline_coupons:
@@ -80,6 +79,7 @@ UserEvents:
     ]
 }
 """
+import math
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -88,7 +88,6 @@ import numpy as np
 import pandas as pd
 import tqdm
 from loguru import logger as LOG
-from cached_property import cached_property
 
 from z1_raw import apply_discount_rate
 
@@ -135,6 +134,10 @@ def _get_coupon_event_type(df, line):
         pd.Series(line + '_receive_coupon', index=df.index[receive_coupon]),
     ]).sort_index()
     return event_type
+
+
+def with_discount(df, df_discount):
+    return pd.merge(df, df_discount, how='left', left_on='discount_name', right_index=True)
 
 
 class O2OEvents:
@@ -297,368 +300,497 @@ def build_index_of(df_raw_offline, df_raw_test, key):
     return np.unique(np.concatenate(values))
 
 
-def set_and_sort_index(df, key):
-    if isinstance(key, (tuple, list)):
-        index_columns = [*key, 'date', 'event_type']
-        df = df.loc[df[key].dropna().index]
-    else:
-        index_columns = [key, 'date', 'event_type']
-        df = df[df[key].notnull()]
-    df = df.set_index(index_columns)
-    df.sort_index(inplace=True)
-    return df
+try:
+    profile
+except NameError:
+    def profile(f):
+        return f
 
 
-def profile(f):
-    return f
+class IndexedEvents:
+    def __init__(self, df_events, key_column):
+        self.key_column = key_column
+        self.is_multikey = not isinstance(key_column, str)
 
+        with TLOG('dropna'):
+            if self.is_multikey:
+                df_events = df_events.loc[df_events[key_column].dropna().index]
+            else:
+                df_events = df_events[df_events[key_column].notnull()]
 
-# def where_event_type(df, event_type):
-#     if isinstance(event_type, (list, tuple)):
-#         return df.loc[pd.IndexSlice[:, event_type], :]
-#     try:
-#         return df.xs(event_type, level='event_type')
-#     except KeyError:
-#         # return empty dataframe instead of raise KeyError
-#         return df.head(0)
+        with TLOG('_wide_df'):
+            df_events = self._wide_df(df_events.copy())
+
+        with TLOG('sort_values'):
+            cols = ['t', 'is_offline', 'is_coupon', 'is_buy']
+            if self.is_multikey:
+                cols = self.key_column + cols
+            else:
+                cols = [self.key_column] + cols
+            df_events = df_events.sort_values(cols)
+        self.df_events = df_events
+
+        dtype = self._get_np_dtype(df_events)
+        self._data = np.empty((len(df_events),), dtype=np.dtype(dtype, align=True))
+        with TLOG('convert to numpy'):
+            for name in df_events.columns:
+                self._data[name] = df_events[name].values
+
+        self._index = {}
+        with TLOG('_build_index'):
+            if self.is_multikey:
+                values = self._multikey_values(df_events)
+            else:
+                values = df_events[[self.key_column, 't']].values
+            self._build_index(values)
+
+    def _multikey_values(self, df):
+        values = df[[*self.key_column, 't']].values
+        for *key, t in values:
+            yield tuple(key), t
+
+    def _wide_df(self, df):
+        df['is_offline'] = df['event_type'].isin((
+            'offline_receive_coupon',
+            'offline_buy_with_coupon',
+            'offline_buy_without_coupon',
+        ))
+        df['is_coupon'] = df['event_type'].isin((
+            'offline_receive_coupon',
+            'online_receive_coupon',
+            'offline_buy_with_coupon',
+            'online_buy_with_coupon',
+        ))
+        df['is_buy'] = df['event_type'].isin((
+            'offline_buy_with_coupon',
+            'online_buy_with_coupon',
+        ))
+        df['is_offline_receive_coupon'] = df['is_offline'] & df['is_coupon'] & (~df['is_buy'])
+        df['is_offline_buy_with_coupon'] = df['is_offline'] & df['is_coupon'] & (df['is_buy'])
+        df['is_offline_buy_without_coupon'] = df['is_offline'] & (~df['is_coupon']) & df['is_buy']
+        df['is_online_receive_coupon'] = (~df['is_offline']) & df['is_coupon'] & (~df['is_buy'])
+        df['is_online_buy_with_coupon'] = (~df['is_offline']) & df['is_coupon'] & (df['is_buy'])
+        df['is_online_buy_without_coupon'] = (~df['is_offline']) & (~df['is_coupon']) & df['is_buy']
+        df['is_online_click'] = (~df['is_offline']) & (~df['is_coupon']) & (~df['is_buy'])
+        df['t'] = df['date'].dt.dayofyear - 1
+        df['t2'] = df['date2'].dt.dayofyear - 1
+        return df
+
+    def _get_np_dtype(self, df):
+        np_dtype = []
+        for k, v in df.dtypes.items():
+            if v == np.object:
+                v = np.str
+            else:
+                try:
+                    v = np.dtype(v)
+                except TypeError:
+                    v = np.str
+            np_dtype.append((k, v))
+        return np_dtype
+
+    @profile
+    def _build_index(self, values):
+        prev_key = None
+        prev_t = 0
+        for i, (key, t) in enumerate(values):
+            if key == prev_key:
+                idx = self._index[key]
+                if t == prev_t:
+                    # prev merchant, prev date
+                    pass
+                else:
+                    # prev merchant, new date
+                    idx[prev_t, 1] = i - 1
+                    idx[prev_t+1:t, 0] = i - 1
+                    idx[t, 0] = i
+            else:
+                # new merchant, new date
+                idx = np.full((366, 2), -1)
+                idx[:t, 0] = i - 1
+                idx[t, 0] = i
+                self._index[key] = idx
+                if prev_key is not None:
+                    prev_idx = self._index[prev_key]
+                    prev_idx[prev_t, 1] = i - 1
+                    prev_idx[prev_t+1:, 0] = i - 1
+            prev_key = key
+            prev_t = t
+        if prev_key is not None:
+            prev_idx = self._index[prev_key]
+            prev_idx[prev_t, 1] = i - 1
+            prev_idx[prev_t+1:, 0] = i - 1
+
+    def loc(self, key, t1=None, t2=None):
+        idx = self._index[key]
+        if t1 is None:
+            t1 = 0
+        if t2 is None:
+            t2 = 365
+        i1, j1 = idx[t1]
+        i2, j2 = idx[t2]
+        if j1 == -1:
+            i = i1 + 1
+        else:
+            i = i1
+        if j2 == -1:
+            j = i2 + 1
+        else:
+            j = j2 + 1
+        return self._data[i:j]
 
 
 class EventsSnapshot:
-    def __init__(self, df_dict, date, recent_begin, recent_end):
-        self.df_dict = df_dict
-        self.date = date
-        self.recent_begin = recent_begin
-        self.recent_end = recent_end
+
+    OP_NAMES = [
+        'history',
+        'future',
+        'recent',
+        'today',
+        'yesterday',
+    ]
+
+    def __init__(self, key, t):
+        self.key = key
+        self.t = t
+        (
+            self.yesterday,
+            self.future_begin,
+            self.future_end,
+            self.recent_end,
+            self.recent_begin,
+            self.history_end,
+        ) = DATE_RANGES[t]
+
+    @property
+    def ops(self):
+        return {
+            'history': self.op_history,
+            'future': self.op_future,
+            'recent': self.op_recent,
+            'today': self.op_today,
+            'yesterday': self.op_yesterday,
+
+        }
 
     def __repr__(self):
-        return '<{} {}/{}>'.format(
-            self.__class__.__name__, self.recent_begin.date(), self.recent_end.date())
+        return '({} key={!r} t={!r})'.format(self.__class__.__name__, self.key, self.t)
 
-    @cached_property
-    def history_dict(self):
-        return {k: df.loc[:self.recent_begin] for k, df in self.df_dict.items()}
+    def op_history(self, events):
+        return events.loc(self.key, None, self.history_end)
 
-    @cached_property
-    def recent_dict(self):
-        return {k: df.loc[self.recent_begin:self.recent_end] for k, df in self.df_dict.items()}
+    def op_future(self, events):
+        return events.loc(self.key, self.future_begin, self.future_end)
 
-    @cached_property
-    def today_dict(self):
-        return {k: df.loc[self.date:self.date] for k, df in self.df_dict.items()}
+    def op_recent(self, events):
+        return events.loc(self.key, self.recent_begin, self.recent_end)
 
-    @cached_property
-    def yesterday_dict(self):
-        return {k: df.loc[self.recent_end:self.recent_end] for k, df in self.df_dict.items()}
+    def op_today(self, events):
+        return events.loc(self.key, self.t, self.t)
 
-    @cached_property
-    def history(self):
-        return pd.concat(self.history_dict.values(), copy=False)
-
-    @cached_property
-    def recent(self):
-        return pd.concat(self.recent_dict.values(), copy=False)
-
-    @cached_property
-    def today(self):
-        return pd.concat(self.today_dict.values(), copy=False)
-
-    @cached_property
-    def yesterday(self):
-        return pd.concat(self.yesterday_dict.values(), copy=False)
-
-    @cached_property
-    def recent_offline(self):
-        offline = ['offline_receive_coupon',
-                   'offline_buy_with_coupon',
-                   'offline_buy_without_coupon']
-        return pd.concat([self.recent_dict[k] for k in offline], copy=False)
-
-    @cached_property
-    def yesterday_offline_receive_coupon(self):
-        return self.yesterday_dict['offline_receive_coupon']
-
-    @cached_property
-    def yesterday_offline_buy_without_coupon(self):
-        return self.yesterday_dict['offline_buy_without_coupon']
-
-    @cached_property
-    def recent_offline_receive_coupon(self):
-        return self.recent_dict['offline_receive_coupon']
-
-    @cached_property
-    def recent_offline_buy_with_coupon(self):
-        return self.recent_dict['offline_buy_with_coupon']
-
-    @cached_property
-    def recent_offline_buy_without_coupon(self):
-        return self.recent_dict['offline_buy_without_coupon']
-
-    @cached_property
-    def recent_online_receive_coupon(self):
-        return self.recent_dict['online_receive_coupon']
-
-    @cached_property
-    def recent_online_buy_with_coupon(self):
-        return self.recent_dict['online_buy_with_coupon']
-
-    @cached_property
-    def recent_online_buy_without_coupon(self):
-        return self.recent_dict['online_buy_without_coupon']
-
-    @cached_property
-    def recent_online_click(self):
-        return self.recent_dict['online_click']
-
-    @cached_property
-    def history_offline_receive_coupon(self):
-        return self.history_dict['offline_receive_coupon']
-
-    @cached_property
-    def history_offline_buy_with_coupon(self):
-        return self.history_dict['offline_buy_with_coupon']
-
-    @cached_property
-    def history_offline_buy_without_coupon(self):
-        return self.history_dict['offline_buy_without_coupon']
-
-    @cached_property
-    def history_online_receive_coupon(self):
-        return self.history_dict['online_receive_coupon']
-
-    @cached_property
-    def history_online_buy_with_coupon(self):
-        return self.history_dict['online_buy_with_coupon']
-
-    @cached_property
-    def history_online_buy_without_coupon(self):
-        return self.history_dict['online_buy_without_coupon']
-
-    @cached_property
-    def history_online_click(self):
-        return self.history_dict['online_click']
+    def op_yesterday(self, events):
+        return events.loc(self.key, self.yesterday, self.yesterday)
 
 
-def divide_zero(a, b):
-    if math.isclose(b, 0):
+def op_unique_coupon(arr):
+    return np.unique(arr['coupon_id'])
+
+
+def op_unique_user(arr):
+    return np.unique(arr['user_id'])
+
+
+def op_unique_merchant(arr):
+    return np.unique(arr['user_id'])
+
+
+def op_offline_receive_coupon(arr):
+    return arr[arr['is_offline_receive_coupon']]
+
+
+def op_offline_buy_with_coupon(arr):
+    return arr[arr['is_offline_buy_with_coupon']]
+
+
+def op_offline_buy_without_coupon(arr):
+    return arr[arr['is_offline_buy_without_coupon']]
+
+
+def op_offline(arr):
+    return arr[arr['is_offline']]
+
+
+def op_online_receive_coupon(arr):
+    return arr[arr['is_online_receive_coupon']]
+
+
+def op_online_buy_with_coupon(arr):
+    return arr[arr['is_online_buy_with_coupon']]
+
+
+def op_online_buy_without_coupon(arr):
+    return arr[arr['is_online_buy_without_coupon']]
+
+
+def op_online_click(arr):
+    return arr[arr['is_online_click']]
+
+
+def op_online(arr):
+    return arr[arr['is_online']]
+
+
+def op_discount_rate(arr):
+    return arr['discount_rate']
+
+
+def op_distance(arr):
+    return arr['distance']
+
+
+def op_timedelta(arr):
+    return arr['t'] - arr['t2']
+
+
+def op_man200(arr):
+    return arr[arr['discount_man'] >= 200]
+
+
+def op_count(arr):
+    return len(arr)
+
+
+def op_min(arr):
+    # TODO: FloatingPointError
+    return np.min(arr) if len(arr) > 0 else 0
+
+
+def op_max(arr):
+    return np.max(arr) if len(arr) > 0 else 0
+
+
+def op_mean(arr):
+    return np.mean(arr) if len(arr) > 0 else 0
+
+
+def op_div(a, b):
+    if b == 0 or math.isclose(b, 0):
         return 0
     return a / b
 
 
-def with_discount(df, df_discount):
-    return pd.merge(df, df_discount, how='left', left_on='discount_name', right_index=True)
+def op_sub(a, b):
+    return a - b
 
 
-def safe_loc(df, label):
-    try:
-        return df.loc[label]
-    except KeyError:
-        return df.head(0).reset_index(level=0, drop=True)
+CALCULATION_OPS = {
+    'unique_coupon': op_unique_coupon,
+    'unique_user': op_unique_user,
+    'unique_merchant': op_unique_merchant,
+    'offline_receive_coupon': op_offline_receive_coupon,
+    'offline_buy_with_coupon': op_offline_buy_with_coupon,
+    'offline_buy_without_coupon': op_offline_buy_without_coupon,
+    'offline': op_offline,
+    'online_receive_coupon': op_online_receive_coupon,
+    'online_buy_with_coupon': op_online_buy_with_coupon,
+    'online_buy_without_coupon': op_online_buy_without_coupon,
+    'online_click': op_online_click,
+    'online': op_online,
+    'discount_rate': op_discount_rate,
+    'distance': op_distance,
+    'timedelta': op_timedelta,
+    'man200': op_man200,
+    'count': op_count,
+    'min': op_min,
+    'max': op_max,
+    'mean': op_mean,
+}
+
+COMBINATION_OPS = {
+    'sub': op_sub,
+    'div': op_div,
+}
+
+OP_NAMES = [
+    *EventsSnapshot.OP_NAMES,
+    *CALCULATION_OPS.keys(),
+    *COMBINATION_OPS.keys(),
+]
+
+
+def build_date_ranges():
+    d = np.arange(366)
+    yesterday = np.clip(d - 1, 0, 365)
+    future_begin = np.clip(d + 1, 0, 365)
+    future_end = np.clip(d + 15, 0, 365)
+    recent_end = np.clip(d - 15, 0, 365)
+    recent_begin = np.clip(d - 74, 0, 365)
+    history_end = np.clip(d - 75, 0, 365)
+    return list(zip(
+        yesterday,
+        future_begin,
+        future_end,
+        recent_end,
+        recent_begin,
+        history_end,
+    ))
+
+
+DATE_RANGES = build_date_ranges()
+
+
+class FeatureExtractor:
+
+    def __init__(self, definition):
+        self.calculation = []
+        self.combination = []
+        for line in definition.strip().splitlines():
+            line = line.split('#', 1)[0].strip().replace(' ', '')
+            if not line:
+                continue
+            feature = line
+            if '(' in line:
+                prefix, line = line.split('(', 1)
+                line = line[:-1]
+                if '-' in line:
+                    op = 'sub'
+                    left, right = line.split('-', 1)
+                else:
+                    assert '/' in line, f'invalid syntax {line}'
+                    op = 'div'
+                    left, right = line.split('/', 1)
+                left = '.{}.{}'.format(prefix, left)
+                right = '.{}.{}'.format(prefix, right)
+                self.combination.append((feature, op, left, right))
+            else:
+                steps = tuple(line.split('.'))
+                self.calculation.append((feature, steps))
+        self.features = []
+        self.features.extend(x[0] for x in self.calculation)
+        self.features.extend(x[0] for x in self.combination)
+        self.calculation = [x[1] for x in self.calculation]
+        self.combination = [x[1:] for x in self.combination]
+        self.check_missing_ops()
+
+    def check_missing_ops(self):
+        ops = set()
+        for steps in self.calculation:
+            ops.update(steps)
+        ops.update(x[0] for x in self.combination)
+        missing = list(sorted(ops - set(OP_NAMES)))
+        if missing:
+            raise ValueError('missing ops: {}'.format(missing))
+
+    @profile
+    def extract(self, events, key, t):
+        snapshot = EventsSnapshot(key, t)
+        calculation_ops = {
+            **CALCULATION_OPS,
+            **snapshot.ops,
+        }
+        combination_ops = COMBINATION_OPS
+        ret = []
+        cache = {}
+        for steps in self.calculation:
+            arr = events
+            name = ''
+            for step in steps:
+                name += '.' + step
+                if name in cache:
+                    arr = cache[name]
+                else:
+                    arr = calculation_ops[step](arr)
+                    cache[name] = arr
+            ret.append(arr)
+        for op, left, right in self.combination:
+            v = combination_ops[op](cache[left], cache[right])
+            ret.append(v)
+        return ret
 
 
 class BaseFeature:
 
-    def __init__(self, df_events, keys, df_discount, recent_days=60, recent_offset_days=15):
+    def __init__(self, df_events, keys, df_discount):
         self.name = self.__class__.__name__
         self.columns = self.__class__.COLUMNS
-        if not isinstance(self.__class__.KEY_NAMES, (tuple, list)):
-            self.key_names = [self.__class__.KEY_NAMES]
-        else:
-            self.key_names = list(self.__class__.KEY_NAMES)
-        self.is_multikey = len(self.key_names) > 1
+        self.key_column = self.__class__.KEY_COLUMN
+        self.is_multikey = not isinstance(self.key_column, str)
         self.df_events = df_events
-        self.keys = keys[:1000]
-        self.df_discount = df_discount
-        self.recent_days = recent_days
-        self.recent_offset_days = recent_offset_days
-        self._recent_offset_timedelta = pd.Timedelta(days=self.recent_offset_days)
-        self._recent_timedelta = pd.Timedelta(days=self.recent_days - 1)
-        self.df_events_dict = dict(list(df_events.groupby('event_type')))
-        with TLOG('preprocess events'):
-            self.df_dict = {}
-            for k, df in self.df_events_dict.items():
-                self.df_dict[k] = self.preprocess_events(df, self.key_names)
-
-    def preprocess_events(self, df, key_names):
-        index_columns = [*key_names, 'date']
         if self.is_multikey:
-            df = df.loc[df[key_names].dropna().index]
-        else:
-            df = df[df[key_names[0]].notnull()]
-        df = df.set_index(index_columns)
-        df.sort_index(inplace=True)
-        return df
+            keys = [tuple(x) for x in keys]
+        self.keys = keys
+        self.df_discount = df_discount
 
     @profile
-    def date_span_of(self, value):
-        df_receive_coupon = value['offline_receive_coupon']
-        idx_date = df_receive_coupon.index.get_level_values('date').unique()
-        recent_end = idx_date - self._recent_offset_timedelta
-        recent_begin = recent_end - self._recent_timedelta
-        return zip(idx_date, recent_begin, recent_end)
-
-    def with_discount(self, df):
-        return with_discount(df, self.df_discount)
+    def process(self):
+        df = with_discount(self.df_events, self.df_discount)
+        events = IndexedEvents(df, key_column=self.key_column)
+        result = []
+        for key in tqdm.tqdm(self.keys):
+            sub_events = events.loc(key)
+            idx_date = np.unique(sub_events['t'])
+            for t in idx_date:
+                row = self.process_snapshot(events, key, t)
+                if self.is_multikey:
+                    result.append([*key, t, *row])
+                else:
+                    result.append([key, t, *row])
+        df_result = pd.DataFrame.from_records(result, columns=self.COLUMNS)
+        return df_result
 
     def process_snapshot(self, key, snapshot):
         raise NotImplementedError
 
-    @profile
-    def get_value(self, key):
-        if self.is_multikey:
-            return {k: safe_loc(df, tuple(key)) for k, df in self.df_dict.items()}
-        else:
-            return {k: safe_loc(df, key) for k, df in self.df_dict.items()}
 
-    @profile
-    def process(self):
-        result = []
-        for key in tqdm.tqdm(self.keys, desc=self.name):
-            df_sub_dict = self.get_value(key)
-            for date, recent_begin, recent_end in self.date_span_of(df_sub_dict):
-                snapshot = EventsSnapshot(df_sub_dict, date, recent_begin, recent_end)
-                if self.is_multikey:
-                    row = self.process_snapshot(*key, date, snapshot)
-                    if row is not None:
-                        result.append([*key, date, *row])
-                else:
-                    row = self.process_snapshot(key, date, snapshot)
-                    if row is not None:
-                        result.append([key, date, *row])
-        df_result = pd.DataFrame.from_records(result, columns=self.columns)
-        return df_result
+USER_FEATURE = """
+recent.offline_receive_coupon.count  # 用户领取优惠券次数
+recent.offline_buy_with_coupon.count  # 用户获得优惠券并核销次数
+recent.offline_buy_without_coupon.count  # 无券购买次数
+# 用户核销优惠券的平均/最低/最高消费折率
+recent.offline_buy_with_coupon.discount_rate.mean
+recent.offline_buy_with_coupon.discount_rate.min
+recent.offline_buy_with_coupon.discount_rate.max
+recent.offline_buy_with_coupon.man200.count  # 用户满200~500减的优惠券
+recent.offline_receive_coupon.man200.count  # 用户满200~500减的优惠券
+recent.offline.unique_merchant.count  # 所有不同商家数量
+recent.offline.unique_coupon.count  # 所有不同优惠券数量
+recent.offline_buy_with_coupon.unique_merchant.count  # 用户核销过优惠券的不同商家数量
+recent.offline_buy_with_coupon.unique_coupon.count  # 用户核销过的不同优惠券数量
+# 用户核销优惠券中的平均/最大/最小用户-商家距离
+recent.offline_buy_with_coupon.distance.mean
+recent.offline_buy_with_coupon.distance.min
+recent.offline_buy_with_coupon.distance.max
+# 用户核销过优惠券的不同商家数量占所有不同商家的比重
+recent(offline_buy_with_coupon.unique_merchant.count / offline.unique_merchant.count)
+# 用户核销过优惠券的不同优惠券数量占所有不同优惠券的比重
+recent(offline_buy_with_coupon.unique_coupon.count / offline.unique_coupon.count)
+recent(offline_receive_coupon.count - offline_buy_with_coupon.count)  # 用户获得优惠券但没有消费的次数
+recent(offline_buy_with_coupon.count / offline_receive_coupon.count)  # 用户领取优惠券后进行核销率
+# 用户平均核销每个商家多少张优惠券
+recent(offline_buy_with_coupon.count / offline_buy_with_coupon.unique_merchant.count)
+# 用户满200~500减的优惠券核销率
+recent(offline_buy_with_coupon.man200.count / offline_receive_coupon.man200.count)
+recent.online_click.count  # 用户线上点击次数
+recent.online_receive_coupon.count  # 用户线上领取次数
+recent.online_buy_with_coupon.count  # 用户线上核销次数
+recent.online_buy_without_coupon.count  # 用户线上购买次数
+recent(online_receive_coupon.count / online_click.count)  # 用户线上优惠券领取率
+recent(online_buy_with_coupon.count / online_receive_coupon.count)  # 用户线上优惠券核销率
+"""
+UserFeatureExtractor = FeatureExtractor(USER_FEATURE)
 
 
 class UserFeature(BaseFeature):
 
-    KEY_NAMES = 'user_id'
+    KEY_COLUMN = 'user_id'
     COLUMNS = [
         'user_id',
         'date',
-        'recent_receive_coupon_count',
-        'recent_buy_without_coupon_count',
-        'recent_buy_without_coupon_nunique',
-        'recent_buy_with_coupon_count',
-        'recent_hold_coupon_count',
-        'recent_buy_with_coupon_rate',
-        'recent_buy_with_man_200_rate',
-        'recent_buy_with_man_200_share',
-        'recent_discount_rate_mean',
-        'recent_discount_rate_min',
-        'recent_discount_rate_max',
-        'recent_buy_with_coupon_merchant_nunique',
-        'recent_buy_with_coupon_merchant_nunique_share',
-        'recent_buy_with_coupon_coupon_nunique',
-        'recent_buy_with_coupon_coupon_nunique_share',
-        'recent_buy_with_coupon_mean_count_per_merchant',
-        'recent_buy_with_coupon_distance_mean',
-        'recent_buy_with_coupon_distance_min',
-        'recent_buy_with_coupon_distance_max',
-        'recent_online_click_count',
-        'recent_online_receive_coupon_count',
-        'recent_online_buy_without_coupon_count',
-        'recent_online_buy_with_coupon_count',
-        'recent_online_not_buy_coupon_count',
-        'recent_online_buy_with_coupon_rate',
-        'recent_online_receive_coupon_rate',
+        *UserFeatureExtractor.features,
     ]
 
-    def process_snapshot(self, user_id, date, snapshot):
-        return [
-            *self.process_offline(user_id, date, snapshot),
-            *self.process_online(user_id, date, snapshot),
-        ]
-
-    def process_offline(self, user_id, date, snapshot):
-        # 用户领取优惠券次数
-        recent_receive_coupon_count = len(snapshot.recent_offline_receive_coupon)
-        # 无券购买次数
-        recent_buy_without_coupon_count = len(snapshot.recent_offline_buy_without_coupon)
-        recent_buy_without_coupon_nunique = snapshot.recent_offline_buy_without_coupon['merchant_id']\
-            .nunique()
-        # 用户获得优惠券并核销次数
-        recent_buy_with_coupon_count = len(snapshot.recent_offline_buy_with_coupon)
-        # 用户获得优惠券但没有消费的次数
-        recent_hold_coupon_count = recent_receive_coupon_count - recent_buy_with_coupon_count
-        # 用户领取优惠券后进行核销率
-        recent_buy_with_coupon_rate = divide_zero(
-            recent_buy_with_coupon_count, recent_receive_coupon_count)
-        # 用户满200~500减的优惠券核销率
-        recent_offline_receive_coupon = self.with_discount(
-            snapshot.recent_offline_receive_coupon)
-        recent_receive_man_200_count = len(
-            recent_offline_receive_coupon[recent_offline_receive_coupon['discount_man'] >= 200])
-        recent_offline_buy_with_coupon = self.with_discount(
-            snapshot.recent_offline_buy_with_coupon)
-        recent_buy_with_man_200_count = len(
-            recent_offline_buy_with_coupon[recent_offline_buy_with_coupon['discount_man'] >= 200])
-        recent_buy_with_man_200_rate = divide_zero(
-            recent_buy_with_man_200_count, recent_receive_man_200_count)
-        # 用户核销满200~500减的优惠券占所有核销优惠券的比重
-        recent_buy_with_man_200_share = divide_zero(
-            recent_buy_with_man_200_count, recent_buy_with_coupon_count)
-        # 用户核销优惠券的平均/最低/最高消费折率
-        discount_rate_stats = recent_offline_buy_with_coupon['discount_rate']\
-            .agg(['mean', 'min', 'max'])
-        # 用户核销过优惠券的不同商家数量，及其占所有不同商家的比重
-        buy_with_coupon_merchant_nunique = recent_offline_buy_with_coupon['merchant_id'].nunique()
-        recent_offline = self.with_discount(snapshot.recent_offline)
-        merchant_nunique = recent_offline['merchant_id'].nunique()
-        buy_with_coupon_merchant_nunique_share = divide_zero(
-            buy_with_coupon_merchant_nunique, merchant_nunique)
-        # 用户核销过的不同优惠券数量，及其占所有不同优惠券的比重
-        buy_with_coupon_coupon_nunique = recent_offline_buy_with_coupon['coupon_id'].nunique()
-        coupon_nunique = recent_offline['coupon_id'].nunique()
-        buy_with_coupon_coupon_nunique_share = divide_zero(
-            buy_with_coupon_coupon_nunique, coupon_nunique)
-        # 用户平均核销每个商家多少张优惠券
-        buy_with_coupon_mean_count_per_merchant = recent_offline_buy_with_coupon\
-            .groupby('merchant_id').size().mean()
-        # 用户核销优惠券中的平均/最大/最小用户-商家距离
-        buy_with_coupon_distance_stats = recent_offline_buy_with_coupon['distance']\
-            .agg(['mean', 'min', 'max'])
-        return [
-            recent_receive_coupon_count,
-            recent_buy_without_coupon_count,
-            recent_buy_without_coupon_nunique,
-            recent_buy_with_coupon_count,
-            recent_hold_coupon_count,
-            recent_buy_with_coupon_rate,
-            recent_buy_with_man_200_rate,
-            recent_buy_with_man_200_share,
-            *discount_rate_stats,
-            buy_with_coupon_merchant_nunique,
-            buy_with_coupon_merchant_nunique_share,
-            buy_with_coupon_coupon_nunique,
-            buy_with_coupon_coupon_nunique_share,
-            buy_with_coupon_mean_count_per_merchant,
-            *buy_with_coupon_distance_stats,
-        ]
-
-    def process_online(self, user_id, date, snapshot):
-        # 用户线上点击次数
-        recent_click_count = len(snapshot.recent_online_click)
-        # 用户线上领取次数
-        recent_receive_coupon_count = len(snapshot.recent_online_receive_coupon)
-        # 用户线上无券购买次数
-        recent_buy_without_coupon_count = len(snapshot.recent_online_buy_without_coupon)
-        # 用户线上核销次数
-        recent_buy_with_coupon_count = len(snapshot.recent_online_buy_with_coupon)
-        # 用户线上不消费次数
-        recent_not_buy_coupon_count = recent_receive_coupon_count - recent_buy_with_coupon_count
-        # 用户线上优惠券核销率
-        recent_buy_with_coupon_rate = divide_zero(
-            recent_buy_with_coupon_count, recent_receive_coupon_count)
-        # 用户线上优惠券领取率
-        recent_receive_coupon_rate = divide_zero(recent_receive_coupon_count, recent_click_count)
-        return [
-            recent_click_count,
-            recent_receive_coupon_count,
-            recent_buy_without_coupon_count,
-            recent_buy_with_coupon_count,
-            recent_not_buy_coupon_count,
-            recent_buy_with_coupon_rate,
-            recent_receive_coupon_rate,
-        ]
+    def process_snapshot(self, events, key, t):
+        return UserFeatureExtractor.extract(events, key, t)
 
     @staticmethod
     def main():
@@ -671,130 +803,28 @@ class UserFeature(BaseFeature):
         df.to_msgpack('data/z6_ts_feature_user.msgpack')
 
 
-class MerchantFeature(BaseFeature):
-
-    KEY_NAMES = 'merchant_id'
-    COLUMNS = [
-        'merchant_id',
-        'date',
-        'yesterday_offline_receive_coupon_count',
-        'yesterday_offline_buy_without_coupon_count',
-        'recent_receive_coupon_count',
-        'recent_buy_without_coupon_count',
-        'recent_buy_without_coupon_nunique',
-        'recent_buy_with_coupon_count',
-        'recent_not_buy_coupon_count',
-        'recent_buy_with_coupon_rate',
-        'buy_with_coupon_coupon_discount_mean',
-        'buy_with_coupon_coupon_discount_min',
-        'buy_with_coupon_coupon_discount_max',
-        'buy_with_coupon_user_nunique',
-        'buy_with_coupon_user_share',
-        'buy_with_coupon_mean_per_user',
-        'buy_with_coupon_coupon_nunique',
-        'buy_with_coupon_coupon_share',
-        'buy_with_coupon_mean_per_coupon',
-        'buy_with_coupon_mean_days',
-        'buy_with_coupon_distance_mean',
-        'buy_with_coupon_distance_min',
-        'buy_with_coupon_distance_max',
-    ]
-
-    @profile
-    def process_snapshot(self, merchant_id, date, snapshot):
-        df = pd.concat(snapshot.df_dict.values(), copy=False)
-        # 昨日领券数
-        yesterday_offline_receive_coupon_count = len(snapshot.yesterday_offline_receive_coupon)
-        yesterday_offline_buy_without_coupon_count = len(
-            snapshot.yesterday_offline_buy_without_coupon)
-        # 商家优惠券被领取次数
-        recent_receive_coupon_count = len(snapshot.recent_offline_receive_coupon)
-        # 无券购买次数
-        recent_buy_without_coupon_count = len(snapshot.recent_offline_buy_without_coupon)
-        recent_buy_without_coupon_nunique = snapshot.recent_offline_buy_without_coupon['user_id']\
-            .nunique()
-        # 商家优惠券被领取后核销次数
-        recent_buy_with_coupon_count = len(snapshot.recent_offline_buy_with_coupon)
-        # 商家优惠券被领取后不核销次数
-        recent_not_buy_coupon_count = recent_receive_coupon_count - recent_buy_with_coupon_count
-        # 商家优惠券被领取后核销率
-        recent_buy_with_coupon_rate = divide_zero(
-            recent_buy_with_coupon_count, recent_receive_coupon_count)
-        # 商家优惠券核销的平均/最小/最大消费折率
-        buy_with_coupon = self.with_discount(snapshot.recent_offline_buy_with_coupon)
-        buy_with_coupon_coupon_stats = buy_with_coupon['discount_rate'].agg(['mean', 'min', 'max'])
-        # 核销商家优惠券的不同用户数量，及其占领取不同的用户比重
-        buy_with_coupon_user_nunique = buy_with_coupon['user_id'].nunique()
-        receive_coupon_user_nunique = snapshot.recent_offline_receive_coupon['user_id'].nunique()
-        buy_with_coupon_user_share = divide_zero(
-            buy_with_coupon_user_nunique, receive_coupon_user_nunique)
-        # 商家优惠券平均每个用户核销多少张
-        buy_with_coupon_mean_per_user = buy_with_coupon.groupby('user_id').size().mean()
-        # 商家被核销过的不同优惠券数量
-        buy_with_coupon_coupon_nunique = buy_with_coupon['coupon_id'].nunique()
-        # 商家被核销过的不同优惠券数量占所有领取过的不同优惠券数量的比重
-        receive_coupon_coupon_nunique = snapshot.recent_offline_receive_coupon['coupon_id'].nunique(
-        )
-        buy_with_coupon_coupon_share = divide_zero(
-            buy_with_coupon_coupon_nunique, receive_coupon_coupon_nunique)
-        # 商家平均每种优惠券核销多少张
-        buy_with_coupon_mean_per_coupon = buy_with_coupon.groupby('coupon_id').size().mean()
-        # 商家被核销优惠券的平均时间率
-        buy_with_coupon_days = (
-            pd.Series(buy_with_coupon.index.get_level_values('date')) -
-            buy_with_coupon['date2'].reset_index(drop=True)
-        ).map(lambda x: x.days)
-        buy_with_coupon_mean_days = buy_with_coupon_days.mean()
-        # 商家被核销优惠券中的平均/最小/最大用户-商家距离
-        buy_with_coupon_distance_stats = buy_with_coupon['distance']\
-            .agg(['mean', 'min', 'max'])
-        return [
-            yesterday_offline_receive_coupon_count,
-            yesterday_offline_buy_without_coupon_count,
-            recent_receive_coupon_count,
-            recent_buy_without_coupon_count,
-            recent_buy_without_coupon_nunique,
-            recent_buy_with_coupon_count,
-            recent_not_buy_coupon_count,
-            recent_buy_with_coupon_rate,
-            *buy_with_coupon_coupon_stats,
-            buy_with_coupon_user_nunique,
-            buy_with_coupon_user_share,
-            buy_with_coupon_mean_per_user,
-            buy_with_coupon_coupon_nunique,
-            buy_with_coupon_coupon_share,
-            buy_with_coupon_mean_per_coupon,
-            buy_with_coupon_mean_days,
-            *buy_with_coupon_distance_stats,
-        ]
-
-    @staticmethod
-    def main():
-        with TLOG('read data'):
-            df = pd.read_msgpack('data/z6_ts_events.msgpack')
-            df_discount = pd.read_msgpack('data/z6_ts_discount.msgpack')
-            merchant_ids = np.load('data/z6_ts_merchant_id.npy')
-        merchant_feature = MerchantFeature(df, df_discount=df_discount, keys=merchant_ids)
-        df = merchant_feature.process()
-        df.to_msgpack('data/z6_ts_feature_merchant.msgpack')
+USER_MERCHANT_FEATURE = """
+recent.offline_receive_coupon.count
+recent.offline_buy_with_coupon.count
+recent.offline_buy_without_coupon.count
+recent(offline_receive_coupon.count - offline_buy_with_coupon.count)
+recent(offline_buy_with_coupon.count / offline_receive_coupon.count)
+"""
+UserMerchantFeatureExtractor = FeatureExtractor(USER_MERCHANT_FEATURE)
 
 
 class UserMerchantFeature(BaseFeature):
 
-    KEY_NAMES = ['user_id', 'merchant_id']
+    KEY_COLUMN = ['user_id', 'merchant_id']
     COLUMNS = [
         'user_id',
         'merchant_id',
         'date',
-        'recent_receive_coupon_count',
-        'recent_buy_without_coupon_count',
-        'recent_buy_with_coupon_count',
-        'recent_not_buy_coupon_count',
-        'recent_buy_with_coupon_rate',
-        'recent_not_buy_share_user',
-        'recent_buy_share_user',
-        'recent_not_buy_share_merchant',
-        'recent_buy_share_merchant',
+        *UserMerchantFeatureExtractor.features,
+        'recent_offline_receive_share_user',
+        'recent_offline_buy_share_user',
+        'recent_offline_receive_share_merchant',
+        'recent_offline_buy_share_merchant',
     ]
 
     def __init__(self, *args, df_feature_user, df_feature_merchant, **kwargs):
@@ -802,53 +832,47 @@ class UserMerchantFeature(BaseFeature):
         self.df_feature_user = df_feature_user.set_index(['user_id', 'date'])
         self.df_feature_merchant = df_feature_merchant.set_index(['merchant_id', 'date'])
 
-    def process_snapshot(self, user_id, merchant_id, date, snapshot):
-        # 用户领取商家的优惠券次数
-        recent_receive_coupon_count = len(snapshot.recent_offline_receive_coupon)
-        # 无券购买次数
-        recent_buy_without_coupon_count = len(snapshot.recent_offline_buy_without_coupon)
-        # 用户领取商家的优惠券后核销次数
-        recent_buy_with_coupon_count = len(snapshot.recent_offline_buy_with_coupon)
-        # 用户领取商家的优惠券后不核销次数
-        recent_not_buy_coupon_count = recent_receive_coupon_count - recent_buy_with_coupon_count
-        # 用户领取商家的优惠券后核销率
-        recent_buy_with_coupon_rate = divide_zero(
-            recent_buy_with_coupon_count, recent_receive_coupon_count)
+    def process_snapshot(self, events, key, t):
+        user_id, merchant_id = key
+        features = UserMerchantFeatureExtractor.extract(events, key, t)
+        receive_coupon_count = features[0]
+        buy_with_coupon_count = features[1]
+
         # 用户对商家的不核销次数占用户总的不核销次数的比重
         try:
-            user_feature = self.df_feature_user.loc[user_id, date]
+            user_feature = self.df_feature_user.loc[user_id, t]
         except KeyError as ex:
             LOG.exception(ex)
-            return None
-        user_not_buy_coupon_count = user_feature['recent_hold_coupon_count']
-        not_buy_share_user = divide_zero(recent_not_buy_coupon_count, user_not_buy_coupon_count)
-        # 用户对每个商家的优惠券核销次数占用户总的核销次数的比重
-        user_buy_with_coupon_coupon = user_feature['recent_buy_with_coupon_count']
-        buy_share_user = divide_zero(recent_buy_with_coupon_count, user_buy_with_coupon_coupon)
+            user_receive_count = 0
+            user_buy_with_count = 0
+        else:
+            user_receive_count = user_feature['recent.offline_receive_coupon.count']
+            user_buy_with_count = user_feature['recent.offline_buy_with_coupon.count']
+        recent_offline_receive_share_user = op_div(receive_coupon_count, user_receive_count)
+        recent_offline_buy_share_user = op_div(buy_with_coupon_count, user_buy_with_count)
+
         # 用户对每个商家的不核销次数占商家总的不核销次数的比重
         try:
-            merchant_feature = self.df_feature_merchant.loc[merchant_id, date]
+            merchant_feature = self.df_feature_merchant.loc[merchant_id, t]
         except KeyError as ex:
             LOG.exception(ex)
-            return None
-        merchant_not_buy_coupon_count = merchant_feature['recent_not_buy_coupon_count']
-        not_buy_share_merchant = divide_zero(
-            recent_not_buy_coupon_count, merchant_not_buy_coupon_count)
-        # 用户对每个商家的优惠券核销次数占商家总的核销次数的比重
-        merchant_buy_with_coupon_count = merchant_feature['recent_buy_with_coupon_count']
-        buy_share_merchant = divide_zero(
-            recent_buy_with_coupon_count, merchant_buy_with_coupon_count)
-        return [
-            recent_receive_coupon_count,
-            recent_buy_without_coupon_count,
-            recent_buy_with_coupon_count,
-            recent_not_buy_coupon_count,
-            recent_buy_with_coupon_rate,
-            not_buy_share_user,
-            buy_share_user,
-            not_buy_share_merchant,
-            buy_share_merchant,
-        ]
+            merchant_receive_count = 0
+            merchant_buy_with_count = 0
+        else:
+            merchant_receive_count = merchant_feature['recent.offline_receive_coupon.count']
+            merchant_buy_with_count = merchant_feature['recent.offline_buy_with_coupon.count']
+        recent_offline_receive_share_merchant = op_div(
+            receive_coupon_count, merchant_receive_count)
+        recent_offline_buy_share_merchant = op_div(buy_with_coupon_count, merchant_buy_with_count)
+
+        features.extend([
+            recent_offline_receive_share_user,
+            recent_offline_buy_share_user,
+            recent_offline_receive_share_merchant,
+            recent_offline_buy_share_merchant,
+        ])
+
+        return features
 
     @staticmethod
     def main():
@@ -865,54 +889,31 @@ class UserMerchantFeature(BaseFeature):
         df.to_msgpack('data/z6_ts_feature_user_merchant.msgpack')
 
 
+COUPON_FEATURE = """
+yesterday.offline_receive_coupon.count
+recent.offline_receive_coupon.count
+recent.offline_buy_with_coupon.count
+recent.offline_buy_with_coupon.unique_user.count
+recent.offline_buy_with_coupon.timedelta.mean
+recent.offline_buy_with_coupon.distance.mean
+recent.offline_buy_with_coupon.distance.min
+recent.offline_buy_with_coupon.distance.max
+recent(offline_buy_with_coupon.count / offline_receive_coupon.count)
+"""
+CouponFeatureExtractor = FeatureExtractor(COUPON_FEATURE)
+
+
 class CouponFeature(BaseFeature):
 
-    KEY_NAMES = 'coupon_id'
+    KEY_COLUMN = 'coupon_id'
     COLUMNS = [
         'coupon_id',
         'date',
-        'yesterday_offline_receive_coupon_count',
-        'recent_receive_coupon_count',
-        'recent_buy_with_coupon_count',
-        'recent_buy_with_coupon_rate',
-        'buy_with_coupon_user_nunique',
-        'buy_with_coupon_mean_days',
-        'buy_with_coupon_distance_mean',
-        'buy_with_coupon_distance_min',
-        'buy_with_coupon_distance_max',
+        *CouponFeatureExtractor.features,
     ]
 
-    def process_snapshot(self, coupon_id, date, snapshot):
-        # 昨日领券数
-        yesterday_offline_receive_coupon_count = len(snapshot.yesterday_offline_receive_coupon)
-        # 领取次数
-        recent_receive_coupon_count = len(snapshot.recent_offline_receive_coupon)
-        # 领取后核销次数
-        recent_buy_with_coupon_count = len(snapshot.recent_offline_buy_with_coupon)
-        # 核销率
-        recent_buy_with_coupon_rate = recent_buy_with_coupon_count / \
-            (recent_receive_coupon_count + 1)
-        # 领取该优惠券用户数
-        buy_with_coupon = snapshot.recent_offline_buy_with_coupon
-        buy_with_coupon_user_nunique = buy_with_coupon['user_id'].nunique()
-        # 核销时间
-        buy_with_coupon_days = (
-            pd.Series(buy_with_coupon.index.get_level_values('date')) -
-            buy_with_coupon['date2'].reset_index(drop=True)
-        ).map(lambda x: x.days)
-        buy_with_mean_days = buy_with_coupon_days.mean()
-        # 核销优惠券中的平均/最小/最大用户-商家距离
-        buy_with_coupon_distance_stats = buy_with_coupon['distance']\
-            .agg(['mean', 'min', 'max'])
-        return [
-            yesterday_offline_receive_coupon_count,
-            recent_receive_coupon_count,
-            recent_buy_with_coupon_count,
-            recent_buy_with_coupon_rate,
-            buy_with_coupon_user_nunique,
-            buy_with_mean_days,
-            *buy_with_coupon_distance_stats,
-        ]
+    def process_snapshot(self, events, key, t):
+        return CouponFeatureExtractor.extract(events, key, t)
 
     @staticmethod
     def main():
@@ -1023,290 +1024,43 @@ class MergedFeature:
 #         coupon_count = len(df)
 
 
-def build_date_ranges():
-    d = np.arange(366)
-    yesterday = np.clip(d - 1, 0, 365)
-    future_begin = np.clip(d + 1, 0, 365)
-    future_end = np.clip(d + 15, 0, 365)
-    recent_end = np.clip(d - 15, 0, 365)
-    recent_begin = np.clip(d - 74, 0, 365)
-    history_end = np.clip(d - 75, 0, 365)
-    return list(zip(
-        yesterday,
-        future_begin,
-        future_end,
-        recent_end,
-        recent_begin,
-        history_end,
-    ))
+MERCHANT_FEATURE = """
+yesterday.offline_receive_coupon.count
+yesterday.offline_buy_without_coupon.count
+recent.unique_coupon.count  # 不同优惠券数量
+recent.offline_receive_coupon.count  # 商家优惠券被领取次数
+recent.unique_user.count  # 核销商家优惠券的不同用户数量
+recent.offline_receive_coupon.unique_user.count
+recent.offline_buy_with_coupon.count  # 商家优惠券被领取后核销次数
+recent.offline_buy_with_coupon.unique_user.count  # 核销商家优惠券的不同用户数量
+recent.offline_buy_with_coupon.unique_coupon.count
+recent.offline_buy_with_coupon.discount_rate.min  # 商家优惠券核销的最小消费折率
+recent.offline_buy_with_coupon.discount_rate.max  # 商家优惠券核销的最大消费折率
+recent.offline_buy_with_coupon.discount_rate.mean  # 商家优惠券核销的平均消费折率
+recent.offline_buy_with_coupon.distance.min  # 商家优惠券核销的最小距离
+recent.offline_buy_with_coupon.distance.max  # 商家优惠券核销的最大距离
+recent.offline_buy_with_coupon.distance.mean  # 商家优惠券核销的平均距离
+recent.offline_buy_with_coupon.timedelta.mean  # # 商家被核销优惠券的平均时间率
+recent(offline_receive_coupon.count - offline_buy_with_coupon.count)  # 商家优惠券被领取后不核销次数
+recent(offline_buy_with_coupon.count / offline_receive_coupon.count)  # 商家优惠券被领取后核销率
+recent(offline_buy_with_coupon.unique_user.count / offline_receive_coupon.unique_user.count)  # 不同用户数量占领取不同的用户比重
+recent(offline_buy_with_coupon.unique_coupon.count / unique_coupon.count)  # 商家被核销过的不同优惠券数量占所有领取过的不同优惠券数量的比重
+"""
+MerchantFeatureExtractor = FeatureExtractor(MERCHANT_FEATURE)
 
 
-DATE_RANGES = build_date_ranges()
+class MerchantFeature(BaseFeature):
 
-
-class TestMerchantFeature:
-
-    KEY_NAMES = 'merchant_id'
+    KEY_COLUMN = 'merchant_id'
     COLUMNS = [
         'merchant_id',
         'date',
-        'yesterday_offline_receive_coupon_count',
-        'yesterday_offline_buy_without_coupon_count',
-        'recent_receive_coupon_count',
-        'recent_buy_without_coupon_count',
-        'recent_buy_without_coupon_nunique',
-        'recent_buy_with_coupon_count',
-        'recent_not_buy_coupon_count',
-        'recent_buy_with_coupon_rate',
-        'buy_with_coupon_coupon_discount_mean',
-        'buy_with_coupon_coupon_discount_min',
-        'buy_with_coupon_coupon_discount_max',
-        'buy_with_coupon_user_nunique',
-        'buy_with_coupon_user_share',
-        'buy_with_coupon_mean_per_user',
-        'buy_with_coupon_coupon_nunique',
-        'buy_with_coupon_coupon_share',
-        'buy_with_coupon_mean_per_coupon',
-        'buy_with_coupon_mean_days',
-        'buy_with_coupon_distance_mean',
-        'buy_with_coupon_distance_min',
-        'buy_with_coupon_distance_max',
+        *MerchantFeatureExtractor.features,
     ]
 
-    def __init__(self, df_events, df_discount, keys):
-        self.df_events = df_events
-        self.df_discount = df_discount
-        self.keys = keys
-
     @profile
-    def process(self):
-        df = with_discount(self.df_events, self.df_discount)
-        df['is_offline'] = df['event_type'].isin((
-            'offline_receive_coupon',
-            'offline_buy_with_coupon',
-            'offline_buy_without_coupon',
-        ))
-        df['is_coupon'] = df['event_type'].isin((
-            'offline_receive_coupon',
-            'online_receive_coupon',
-            'offline_buy_with_coupon',
-            'online_buy_with_coupon',
-        ))
-        df['is_buy'] = df['event_type'].isin((
-            'offline_buy_with_coupon',
-            'online_buy_with_coupon',
-        ))
-        df['is_offline_receive_coupon'] = df['is_offline'] & df['is_coupon'] & (~df['is_buy'])
-        df['is_offline_buy_with_coupon'] = df['is_offline'] & df['is_coupon'] & (df['is_buy'])
-        df['is_offline_buy_without_coupon'] = df['is_offline'] & (~df['is_coupon']) & df['is_buy']
-        df['is_online_receive_coupon'] = (~df['is_offline']) & df['is_coupon'] & (~df['is_buy'])
-        df['is_online_buy_with_coupon'] = (~df['is_offline']) & df['is_coupon'] & (df['is_buy'])
-        df['is_online_buy_without_coupon'] = (~df['is_offline']) & (~df['is_coupon']) & df['is_buy']
-        df['is_online_receive_coupon'] = (~df['is_offline']) & (~df['is_coupon']) & (~df['is_buy'])
-        df['t'] = df['date'].dt.dayofyear - 1
-        df['t2'] = df['date2'].dt.dayofyear - 1
-        events = IndexedEvents(df)
-        result = []
-        for key in tqdm.tqdm(self.keys):
-            sub_events = events.loc(key)
-            idx_date = np.unique(sub_events['t'])
-            for t in idx_date:
-                row = self.process_snapshot(key, t, events)
-                result.append([key, t, *row])
-        df_result = pd.DataFrame.from_records(result, columns=self.COLUMNS)
-        return df_result
-
-    @profile
-    def process_snapshot(self, key, t, events):
-        yesterday, future_begin, future_end, recent_end, recent_begin, history_end = DATE_RANGES[t]
-        df_yesterday = events.loc(key, yesterday, yesterday)
-        df_recent = events.loc(key, recent_begin, recent_end)
-        df_yesterday_receive_coupon = df_yesterday[
-            df_yesterday['is_offline_receive_coupon']
-        ]
-        df_yesterday_buy_without_coupon = df_yesterday[
-            df_yesterday['is_offline_buy_without_coupon']
-        ]
-        df_recent_receive_coupon = df_recent[
-            df_recent['is_offline_receive_coupon']
-        ]
-        df_recent_buy_with_coupon = df_recent[
-            df_recent['is_offline_buy_with_coupon']
-        ]
-        df_recent_buy_without_coupon = df_recent[
-            df_recent['is_offline_buy_without_coupon']
-        ]
-        # 昨日领券数
-        yesterday_offline_receive_coupon_count = len(df_yesterday_receive_coupon)
-        yesterday_offline_buy_without_coupon_count = len(df_yesterday_buy_without_coupon)
-        # 商家优惠券被领取次数
-        recent_receive_coupon_count = len(df_recent_receive_coupon)
-        # 无券购买次数
-        recent_buy_without_coupon_count = len(df_recent_buy_without_coupon)
-        recent_buy_without_coupon_nunique = len(
-            np.unique(df_recent_buy_without_coupon['user_id']))
-        # 商家优惠券被领取后核销次数
-        recent_buy_with_coupon_count = len(df_recent_buy_with_coupon)
-        # 商家优惠券被领取后不核销次数
-        recent_not_buy_coupon_count = recent_receive_coupon_count - recent_buy_with_coupon_count
-        # 商家优惠券核销的平均/最小/最大消费折率
-        df_discount_rate = df_recent_buy_with_coupon['discount_rate']
-        if len(df_discount_rate) > 0:
-            buy_with_coupon_coupon_mean = np.mean(df_discount_rate)
-            buy_with_coupon_coupon_min = np.mean(df_discount_rate)
-            buy_with_coupon_coupon_max = np.mean(df_discount_rate)
-        else:
-            buy_with_coupon_coupon_mean = 0
-            buy_with_coupon_coupon_min = 0
-            buy_with_coupon_coupon_max = 0
-        # 核销商家优惠券的不同用户数量，及其占领取不同的用户比重
-        buy_with_coupon_user_nunique = len(
-            np.unique(df_recent_buy_with_coupon['user_id']))
-        receive_coupon_user_nunique = len(np.unique(df_recent_receive_coupon['user_id']))
-        # 商家优惠券平均每个用户核销多少张
-        buy_with_coupon_mean_per_user = divide_zero(
-            recent_buy_with_coupon_count,
-            len(np.unique(df_recent['user_id'])))
-        # 商家被核销过的不同优惠券数量
-        coupon_nunique = len(np.unique(df_recent['coupon_id']))
-        buy_with_coupon_coupon_nunique = len(
-            np.unique(df_recent_buy_with_coupon['coupon_id']))
-        # 商家被核销过的不同优惠券数量占所有领取过的不同优惠券数量的比重
-        receive_coupon_coupon_nunique = divide_zero(buy_with_coupon_coupon_nunique, coupon_nunique)
-        # 商家平均每种优惠券核销多少张
-        buy_with_coupon_mean_per_coupon = divide_zero(
-            recent_buy_with_coupon_count,
-            len(np.unique(df_recent['coupon_id'])))
-        # 商家被核销优惠券的平均时间率
-        df_days = df_recent_buy_with_coupon['t'] - df_recent_buy_with_coupon['t2']
-        if len(df_days) > 0:
-            buy_with_coupon_mean_days = np.mean(df_days)
-        else:
-            buy_with_coupon_mean_days = 0
-        # 商家被核销优惠券中的平均/最小/最大用户-商家距离
-        df_distance = df_recent_buy_with_coupon['distance']
-        if len(df_distance) > 0:
-            buy_with_coupon_distance_mean = np.mean(df_distance)
-            buy_with_coupon_distance_min = np.min(df_distance)
-            buy_with_coupon_distance_max = np.max(df_distance)
-        else:
-            buy_with_coupon_distance_mean = 0
-            buy_with_coupon_distance_min = 0
-            buy_with_coupon_distance_max = 0
-        # 商家优惠券被领取后核销率
-        recent_buy_with_coupon_rate = divide_zero(
-            recent_buy_with_coupon_count, recent_receive_coupon_count)
-        buy_with_coupon_user_share = divide_zero(
-            buy_with_coupon_user_nunique, receive_coupon_user_nunique)
-        buy_with_coupon_coupon_share = divide_zero(
-            buy_with_coupon_coupon_nunique, receive_coupon_coupon_nunique)
-        return [
-            yesterday_offline_receive_coupon_count,
-            yesterday_offline_buy_without_coupon_count,
-            recent_receive_coupon_count,
-            recent_buy_without_coupon_count,
-            recent_buy_without_coupon_nunique,
-            recent_buy_with_coupon_count,
-            recent_not_buy_coupon_count,
-            recent_buy_with_coupon_rate,
-            buy_with_coupon_coupon_mean,
-            buy_with_coupon_coupon_min,
-            buy_with_coupon_coupon_max,
-            buy_with_coupon_user_nunique,
-            buy_with_coupon_user_share,
-            buy_with_coupon_mean_per_user,
-            buy_with_coupon_coupon_nunique,
-            buy_with_coupon_coupon_share,
-            buy_with_coupon_mean_per_coupon,
-            buy_with_coupon_mean_days,
-            buy_with_coupon_distance_mean,
-            buy_with_coupon_distance_min,
-            buy_with_coupon_distance_max,
-        ]
-
-    # @profile
-    def process_snapshot_bak(self, merchant_id, date, df_events):
-        yesterday, future_begin, future_end, recent_end, recent_begin, history_end = DATE_RANGES.loc[
-            date]
-        # df_today = df_events.loc[date:date]
-        df_yesterday = df_events.loc[yesterday:yesterday]
-        # df_future = df_events.loc[future_begin:future_end]
-        df_recent = df_events.loc[recent_begin:recent_end]
-        # df_history = df_events.loc[:history_end]
-        # 昨日领券数
-        yesterday_count = df_yesterday.groupby('event_type').agg('count')
-        yesterday_offline_receive_coupon_count = yesterday_count.get('offline_receive_coupon', 0)
-        yesterday_offline_buy_without_coupon_count = yesterday_count.get(
-            'offline_buy_without_coupon', 0)
-        # 商家优惠券被领取次数
-        recent_stats = {
-            'count': df_recent.groupby('event_type')['user_id'].count(),
-            'nunique': {},
-        }
-        try:
-            recent_stats['nunique'] = df_recent.groupby('event_type')['user_id'].nunique()
-        except IndexError:
-            pass
-        recent_receive_coupon_count = recent_stats['count'].get('offline_receive_coupon', 0)
-        # 无券购买次数
-        recent_buy_without_coupon_count = recent_stats['count'].get('offline_buy_without_coupon', 0)
-        recent_buy_without_coupon_nunique = recent_stats['nunique'].get(
-            'offline_buy_without_coupon', 0)
-        # 商家优惠券被领取后核销次数
-        recent_buy_with_coupon_count = recent_stats['count'].get('offline_buy_with_coupon', 0)
-        # 商家优惠券被领取后不核销次数
-        recent_not_buy_coupon_count = recent_receive_coupon_count - recent_buy_with_coupon_count
-        # 商家优惠券被领取后核销率
-        recent_buy_with_coupon_rate = divide_zero(
-            recent_buy_with_coupon_count, recent_receive_coupon_count)
-        # 商家优惠券核销的平均/最小/最大消费折率
-        buy_with_coupon = df_recent[df_recent['event_type'] == 'offline_buy_with_coupon']
-        buy_with_coupon = with_discount(buy_with_coupon, self.df_discount)
-        buy_with_coupon_coupon_stats = buy_with_coupon['discount_rate'].agg(['mean', 'min', 'max'])
-        # 核销商家优惠券的不同用户数量，及其占领取不同的用户比重
-        buy_with_coupon_user_nunique = buy_with_coupon['user_id'].nunique()
-        receive_coupon_user_nunique = recent_stats['nunique'].get('offline_receive_coupon', 0)
-        buy_with_coupon_user_share = divide_zero(
-            buy_with_coupon_user_nunique, receive_coupon_user_nunique)
-        # 商家优惠券平均每个用户核销多少张
-        buy_with_coupon_mean_per_user = buy_with_coupon.groupby('user_id').size().mean()
-        # 商家被核销过的不同优惠券数量
-        buy_with_coupon_coupon_nunique = buy_with_coupon['coupon_id'].nunique()
-        # 商家被核销过的不同优惠券数量占所有领取过的不同优惠券数量的比重
-        receive_coupon = df_recent[df_recent['event_type'] == 'offline_receive_coupon']
-        receive_coupon_coupon_nunique = receive_coupon['coupon_id'].nunique()
-        buy_with_coupon_coupon_share = divide_zero(
-            buy_with_coupon_coupon_nunique, receive_coupon_coupon_nunique)
-        # 商家平均每种优惠券核销多少张
-        buy_with_coupon_mean_per_coupon = buy_with_coupon.groupby('coupon_id').size().mean()
-        # 商家被核销优惠券的平均时间率
-        buy_with_coupon_days = (
-            pd.Series(buy_with_coupon.index.get_level_values('date')) -
-            buy_with_coupon['date2'].reset_index(drop=True)
-        ).map(lambda x: x.days)
-        buy_with_coupon_mean_days = buy_with_coupon_days.mean()
-        # 商家被核销优惠券中的平均/最小/最大用户-商家距离
-        buy_with_coupon_distance_stats = buy_with_coupon['distance']\
-            .agg(['mean', 'min', 'max'])
-        return [
-            yesterday_offline_receive_coupon_count,
-            yesterday_offline_buy_without_coupon_count,
-            recent_receive_coupon_count,
-            recent_buy_without_coupon_count,
-            recent_buy_without_coupon_nunique,
-            recent_buy_with_coupon_count,
-            recent_not_buy_coupon_count,
-            recent_buy_with_coupon_rate,
-            *buy_with_coupon_coupon_stats,
-            buy_with_coupon_user_nunique,
-            buy_with_coupon_user_share,
-            buy_with_coupon_mean_per_user,
-            buy_with_coupon_coupon_nunique,
-            buy_with_coupon_coupon_share,
-            buy_with_coupon_mean_per_coupon,
-            buy_with_coupon_mean_days,
-            *buy_with_coupon_distance_stats,
-        ]
+    def process_snapshot(self, events, key, t):
+        return MerchantFeatureExtractor.extract(events, key, t)
 
     @staticmethod
     def main():
@@ -1314,116 +1068,17 @@ class TestMerchantFeature:
             df = pd.read_msgpack('data/z6_ts_events.msgpack')
             df_discount = pd.read_msgpack('data/z6_ts_discount.msgpack')
             merchant_ids = np.load('data/z6_ts_merchant_id.npy')
-        merchant_feature = TestMerchantFeature(df, df_discount=df_discount, keys=merchant_ids)
+        merchant_feature = MerchantFeature(df, df_discount=df_discount, keys=merchant_ids)
         df = merchant_feature.process()
         df.to_msgpack('data/z6_ts_feature_merchant.msgpack')
 
 
-class IndexedColumn:
-    """IndexedColumn"""
-
-
-class IndexedEvents:
-    def __init__(self, df_events):
-        # df_events = df_events.head(100)
-        with TLOG('sort_values'):
-            df_events = df_events.sort_values(['merchant_id', 'date', 'event_type'])
-        self.df_events = df_events
-
-        self.c = IndexedColumn()
-        for i, name in enumerate(df_events.columns):
-            setattr(self.c, name, i)
-
-        with TLOG('df_index'):
-            df_index = pd.DataFrame({
-                'merchant_id': df_events['merchant_id'],
-                't': df_events['date'].dt.dayofyear - 1
-            }).copy()
-
-        dtype = self._get_np_dtype(df_events)
-        dtype_dict = dict(dtype)
-
-        with TLOG('convert date'):
-            columns = []
-            for name in df_events.columns:
-                v = np.array(df_events[name].values, dtype=dtype_dict[name])
-                columns.append(v)
-        with TLOG('np.array dtype'):
-            self._data = np.array(list(zip(*columns)), dtype=dtype)
-
-        self._index = {}
-        with TLOG('_build_index'):
-            self._build_index(df_index[['merchant_id', 't']])
-
-    def _get_np_dtype(self, df):
-        np_dtype = []
-        for k, v in df.dtypes.items():
-            if v == np.object:
-                v = np.str
-            else:
-                try:
-                    v = np.dtype(v)
-                except TypeError:
-                    v = np.str
-            np_dtype.append((k, v))
-        return np_dtype
-
-    def _build_index(self, df):
-        prev_key = None
-        prev_t = 0
-        for i, (key, t) in tqdm.tqdm(enumerate(df.values), total=len(df)):
-            if key == prev_key:
-                idx = self._index[key]
-                if t == prev_t:
-                    # prev merchant, prev date
-                    pass
-                else:
-                    # prev merchant, new date
-                    idx[prev_t, 1] = i - 1
-                    idx[prev_t+1:t, 0] = i - 1
-                    idx[t, 0] = i
-            else:
-                # new merchant, new date
-                idx = np.full((366, 2), -1)
-                idx[:t, 0] = i - 1
-                idx[t, 0] = i
-                self._index[key] = idx
-                if prev_key is not None:
-                    prev_idx = self._index[prev_key]
-                    prev_idx[prev_t, 1] = i - 1
-                    prev_idx[prev_t+1:, 0] = i - 1
-            prev_key = key
-            prev_t = t
-        if prev_key is not None:
-            prev_idx = self._index[prev_key]
-            prev_idx[prev_t, 1] = i - 1
-            prev_idx[prev_t+1:, 0] = i - 1
-
-    def loc(self, key, t1=None, t2=None):
-        idx = self._index[key]
-        if t1 is None:
-            t1 = 0
-        if t2 is None:
-            t2 = 365
-        i1, j1 = idx[t1]
-        i2, j2 = idx[t2]
-        if j1 == -1:
-            i = i1 + 1
-        else:
-            i = i1
-        if j2 == -1:
-            j = i2 + 1
-        else:
-            j = j2 + 1
-        return self._data[i:j]
-
-
 if __name__ == "__main__":
     # O2OEvents.main()
-    TestMerchantFeature.main()
-    # CouponFeature.main()
-    # UserFeature.main()
-    # UserMerchantFeature.main()
+    MerchantFeature.main()
+    CouponFeature.main()
+    UserFeature.main()
+    UserMerchantFeature.main()
     # MergedFeature.main()
     # with TLOG('read events'):
     #     df_events = pd.read_msgpack('data/z6_ts_events.msgpack')
