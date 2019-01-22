@@ -1,4 +1,3 @@
-import os
 import sys
 import json
 import datetime
@@ -7,13 +6,9 @@ import xgboost as xgb
 import pandas as pd
 import numpy as np
 from loguru import logger as LOG
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from sklearn.feature_selection import SelectKBest, chi2, f_classif
-from sklearn.feature_selection import VarianceThreshold
-from sklearn.decomposition import PCA
-from sklearn.base import TransformerMixin
+from sklearn.metrics import roc_auc_score
 
-# from z3_feature import prefix_columns
+TEST_HAS_LABEL = False
 
 
 def pretty(data):
@@ -26,140 +21,318 @@ def split_feature_label(df):
     return df_x, df_y
 
 
-def get_num_features(total):
-    num = os.getenv('NUM_FEATURES', '').strip()
-    if num == 'all':
-        return num
-    if num.startswith('0.'):
-        num = int(total * float(num))
-    elif num:
-        num = int(num)
-    else:
-        num = int(total * 0.9)
-    return num
+def o2o_auc_score(df):
+    def coupon_auc(df):
+        try:
+            return roc_auc_score(df['label'], df['prob'])
+        except ValueError:
+            return None
+    return df.groupby('coupon_id').apply(coupon_auc).mean()
 
 
-def with_date_feature(df):
-    df['date_dayofweek'] = df['date'].dt.dayofweek
-    df['date_dayofmonth'] = df['date'].dt.day
-
-
-def select_best_features(df_x, df_y):
-    select = VarianceThreshold(0.01)
-    select.fit(df_x.values, df_y.values)
-    best_features = list(df_x.columns[select.get_support()])
-    df_x = df_x[best_features]
-
-    NUM_FEATURES = get_num_features(len(df_x.columns))
-
-    select = SelectKBest(chi2, k=NUM_FEATURES)
-    select.fit(df_x.values, df_y.values)
-    best_features_chi = list(df_x.columns[select.get_support()])
-
-    select = SelectKBest(f_classif, k=NUM_FEATURES)
-    select.fit(df_x.values, df_y.values)
-    best_features_clas = list(df_x.columns[select.get_support()])
-
-    best_features = list(sorted(set(best_features_chi) | set(best_features_clas)))
-    return best_features
-
-
-class ScalerPCA(TransformerMixin):
-    def __init__(self, n_components=None):
-        self._scaler = StandardScaler()
-        self._pca = PCA(n_components=n_components, whiten=True)
-
-    def fit(self, df_x, df_y):
-        self.columns_ = list(df_x.dtypes[df_x.dtypes == np.dtype(float)].index)
-        float_values = self._scaler.fit_transform(df_x[self.columns_].values, df_y.values)
-        bool_values = df_x[df_x.columns.difference(self.columns_)].values
-        values = np.concatenate((float_values, bool_values), axis=1)
-        self._pca.fit(values, df_y.values)
-        self.n_components_ = self._pca.n_components_
-        return self
-
-    def transform(self, df_x):
-        float_values = self._scaler.transform(df_x[self.columns_].values)
-        bool_values = df_x[df_x.columns.difference(self.columns_)].values
-        values = np.concatenate((float_values, bool_values), axis=1)
-        values = self._pca.transform(values)
-        df_pca = pd.DataFrame.from_records(values)
-        return df_pca
+FEATURE_TOP = [
+    'user_merchant:future.offline_receive_coupon.deltanow.min',
+    'merchant:future.offline_receive_coupon.count',
+    'merchant:recent.offline_buy_without_coupon.unique_hotuser.count',
+    'coupon:future.offline_receive_coupon.count',
+    'merchant:future.offline_receive_coupon.unique_user.count',
+    'user:future.offline_receive_coupon.deltanow.min',
+    'merchant:recent.offline_buy_without_coupon.distance.mean',
+    'coupon:today.offline_receive_coupon.count',
+    'discount_rate',
+    'merchant:history.offline_buy_without_coupon.unique_hotuser.count',
+    'merchant:recent.offline_buy_without_coupon.count',
+    'merchant:recent.offline.unique_user.count',
+    'merchant:longago.offline_buy_without_coupon.unique_hotuser.count',
+    'merchant:today.offline_receive_coupon.count',
+    'merchant:recent.offline_buy_without_coupon.unique_user.count',
+    'merchant:history.offline_buy_without_coupon.distance.mean',
+    'merchant:longago.offline_buy_without_coupon.count',
+    'merchant:history.offline.unique_user.count',
+    'date_dayofmonth',
+    'merchant:longago.offline_buy_without_coupon.distance.mean',
+    'user:future.offline_receive_coupon.count',
+    'merchant:history.offline_buy_without_coupon.count',
+    'user_merchant:future.offline_receive_coupon.count',
+    'merchant:today.offline_receive_coupon.unique_user.count',
+    'merchant:history.offline_buy_without_coupon.unique_user.count',
+    'discount_man',
+    'merchant:longago.offline.unique_user.count',
+    'merchant:longago.offline_buy_without_coupon.unique_user.count',
+    'merchant:recent(offline_buy_with_coupon.count/offline_buy_with_coupon.unique_user.count)',
+    'merchant:recent.offline_receive_coupon.count',
+    'user_merchant:recent.offline_buy_without_coupon.count',
+    'merchant:recent.offline_receive_coupon.unique_user.count',
+    'merchant:recent.offline_receive_coupon.discount_rate.mean',
+    'merchant:history(offline_buy_with_coupon.unique_user.count/offline_receive_coupon.unique_user.count)',
+    'merchant:recent(offline_buy_with_coupon.unique_user.count/offline_receive_coupon.unique_user.count)',
+    'coupon:recent.offline_receive_coupon.unique_user.count',
+    'merchant:recent.offline_buy_with_coupon.timedelta.mean',
+    'merchant:recent(offline_buy_with_coupon.count/offline_receive_coupon.count)',
+    'user_merchant:today.offline_receive_coupon.count',
+    'coupon:recent.offline_receive_coupon.count',
+    'distance',
+    'merchant:history.offline_receive_coupon.unique_user.count',
+    'discount_jian',
+    'user:recent.offline_buy_without_coupon.count',
+    'merchant:history(offline_buy_with_coupon.count/offline_receive_coupon.count)',
+    'merchant:history.offline_receive_coupon.count',
+    'merchant:history(offline_buy_with_coupon.count/offline_buy_with_coupon.unique_user.count)',
+    'merchant:recent.offline_buy_with_coupon.count',
+    'merchant:history.offline_buy_with_coupon.timedelta.mean',
+    'user:history.offline_buy_without_coupon.count',
+    'merchant:recent.offline_buy_with_coupon.unique_user.count',
+    'user:today.offline_receive_coupon.count',
+    'user:longago.offline_buy_without_coupon.count',
+    'coupon:recent(offline_buy_with_coupon.count/offline_receive_coupon.count)',
+    'merchant:history.offline_buy_with_coupon.unique_user.count',
+    'user_merchant:longago.offline_buy_without_coupon.count',
+    'merchant:longago(offline_buy_with_coupon.count/offline_buy_with_coupon.unique_user.count)',
+    'user:recent.offline_receive_coupon.discount_rate.mean',
+    'user_merchant:history.offline_buy_without_coupon.count',
+    'merchant:longago(offline_buy_with_coupon.count/offline_receive_coupon.count)',
+    'merchant:history.offline_buy_with_coupon.count',
+    'date_dayofweek',
+    'coupon:recent.offline_buy_with_coupon.timedelta.mean',
+    'merchant:longago.offline_receive_coupon.count',
+    'merchant:recent.offline_buy_with_coupon.timedelta.max',
+    'merchant:longago.offline_receive_coupon.unique_user.count',
+    'merchant:recent.offline_buy_with_coupon.unique_hotuser.count',
+    'merchant:recent.offline_buy_with_coupon.discount_rate.mean',
+    'merchant:history.offline_receive_coupon.discount_rate.mean',
+    'merchant:longago(offline_buy_with_coupon.unique_user.count/offline_receive_coupon.unique_user.count)',
+    'merchant:longago.offline_buy_with_coupon.timedelta.mean',
+    'user:history.online_click.count',
+    'user:future.offline_receive_coupon.unique_merchant.count',
+    'merchant:history.offline_buy_with_coupon.discount_rate.mean',
+    'merchant:history.offline_buy_without_coupon.distance.max',
+    'user:longago.offline_receive_coupon.discount_rate.mean',
+    'merchant:longago.offline_buy_with_coupon.unique_user.count',
+    'merchant:recent.offline_buy_with_coupon.distance.mean',
+    'user:recent.online_click.count',
+    'user:history.offline_buy_with_coupon.timedelta.mean',
+    'user:longago.offline.unique_merchant.count',
+    'coupon:history.offline_receive_coupon.unique_user.count',
+    'merchant:history.offline_buy_with_coupon.timedelta.max',
+    'merchant:longago.offline_buy_without_coupon.distance.max',
+    'merchant:history.offline_buy_with_coupon.distance.mean',
+    'merchant:recent.offline_receive_coupon.discount_rate.min',
+    'merchant:history.offline_buy_with_coupon.timedelta.min',
+    'merchant:history.offline_buy_with_coupon.unique_hotuser.count',
+    'coupon:recent.offline_receive_coupon.distance.mean',
+    'merchant:longago.offline_buy_with_coupon.count',
+    'user:history.online_buy_without_coupon.count',
+    'user:history.offline_receive_coupon.discount_rate.mean',
+    'coupon:recent.offline_buy_with_coupon.unique_user.count',
+    'user:recent.online_receive_coupon.count',
+    'user:history.offline.unique_merchant.count',
+    'merchant:recent.offline_receive_coupon.discount_rate.max',
+    'merchant:longago.offline_buy_with_coupon.distance.mean',
+    'merchant:history.offline_buy_with_coupon.discount_rate.min',
+    'merchant:recent.offline_buy_without_coupon.distance.max',
+    'user_merchant:recent(offline_receive_coupon.count-offline_buy_with_coupon.count)',
+    'coupon:recent.offline_buy_with_coupon.count',
+    'user:recent.offline_buy_without_coupon.distance.mean',
+    'user:history.online_receive_coupon.count',
+    'user:recent.online_buy_without_coupon.count',
+    'user:history.offline_buy_without_coupon.distance.mean',
+    'user:recent.offline.unique_merchant.count',
+    'coupon:history.offline_receive_coupon.count',
+    'merchant:recent.offline_buy_with_coupon.discount_rate.max',
+    'merchant:recent.offline_buy_with_coupon.discount_rate.min',
+    'merchant:recent.offline_buy_with_coupon.timedelta.min',
+    'coupon:longago.offline_receive_coupon.count',
+    'user:recent.offline_receive_coupon.discount_rate.min',
+    'user:recent.offline_receive_coupon.discount_rate.max',
+    'user:longago.offline_buy_without_coupon.distance.mean',
+    'user:recent.offline_receive_coupon.count',
+    'user:history.offline_receive_coupon.discount_rate.min',
+    'merchant:history.offline_receive_coupon.discount_rate.min',
+    'user:history(online_receive_coupon.count/online_click.count)',
+    'user:future.offline_receive_coupon.unique_coupon.count',
+    'coupon:history.offline_receive_coupon.distance.mean',
+    'user:recent.offline_buy_with_coupon.timedelta.mean',
+    'user:longago.offline_buy_without_coupon.distance.max',
+    'merchant:longago.offline_receive_coupon.discount_rate.mean',
+    'user:history.offline_receive_coupon.discount_rate.max',
+    'user_merchant:history(offline_receive_coupon.count-offline_buy_with_coupon.count)',
+    'user:recent.offline_buy_without_coupon.distance.min',
+    'merchant:longago.offline_buy_with_coupon.discount_rate.mean',
+    'user:history.offline_receive_coupon.count',
+    'merchant:history.offline_receive_coupon.discount_rate.max',
+    'user:longago.offline_receive_coupon.discount_rate.min',
+    'user:longago.offline_receive_coupon.count',
+    'merchant:longago.offline_buy_with_coupon.timedelta.max',
+    'user:longago.offline_buy_without_coupon.distance.min',
+    'user:recent.offline_buy_with_coupon.timedelta.max',
+    'user:recent.offline_buy_without_coupon.distance.max',
+    'coupon:recent.offline_buy_with_coupon.distance.mean',
+    'user:recent(offline_buy_with_coupon.count/offline_receive_coupon.count)',
+    'merchant:history.offline_buy_with_coupon.discount_rate.max',
+    'merchant:longago.offline_buy_with_coupon.timedelta.min',
+    'user:recent.offline_buy_with_coupon.timedelta.min',
+    'coupon:history(offline_buy_with_coupon.count/offline_receive_coupon.count)',
+    'merchant:recent.offline_buy_with_coupon.distance.max',
+    'coupon:recent.offline_receive_coupon.distance.max',
+    'user_merchant:recent.offline_receive_coupon.count',
+    'coupon:longago.offline_receive_coupon.distance.mean',
+    'merchant:longago.offline_buy_with_coupon.unique_hotuser.count',
+    'user:history(offline_buy_with_coupon.count/offline_receive_coupon.count)',
+    'user:history.offline_buy_without_coupon.distance.max',
+    'user:history.offline_buy_without_coupon.distance.min',
+    'user:longago.offline_receive_coupon.discount_rate.max',
+    'user:recent.offline_receive_coupon.man200.count',
+    'user:longago.offline_buy_with_coupon.timedelta.min',
+    'user_merchant:recent(offline_buy_with_coupon.count/offline_receive_coupon.count)',
+    'merchant:longago.offline_receive_coupon.discount_rate.min',
+    'user:history.offline_buy_with_coupon.timedelta.max',
+    'merchant:longago.offline_receive_coupon.discount_rate.max',
+    'merchant:recent.offline_buy_without_coupon.distance.min',
+    'user:recent(online_receive_coupon.count/online_click.count)',
+    'merchant:recent.offline_buy_with_coupon.distance.min',
+    'user:recent.offline_buy_with_coupon.discount_rate.max',
+    'user:history.offline_buy_with_coupon.timedelta.min',
+    'user_merchant:history.offline_buy_with_coupon.count',
+    'user:longago.offline_buy_with_coupon.timedelta.mean',
+    'coupon:longago.offline_receive_coupon.unique_user.count',
+    'merchant:history.offline_buy_with_coupon.distance.max',
+    'user:recent.online_buy_with_coupon.count',
+    'merchant:history.offline_buy_without_coupon.distance.min',
+    'user:longago.offline_receive_coupon.man200.count',
+    'user:longago(offline_buy_with_coupon.count/offline_receive_coupon.count)',
+    'merchant:longago.offline_buy_with_coupon.discount_rate.min',
+    'merchant:longago.offline_buy_without_coupon.distance.min',
+    'user:recent.offline_buy_with_coupon.discount_rate.mean',
+    'user_merchant:longago(offline_receive_coupon.count-offline_buy_with_coupon.count)',
+    'merchant:longago.offline_buy_with_coupon.discount_rate.max',
+    'coupon:history.offline_buy_with_coupon.count',
+    'user_merchant:history.offline_receive_coupon.count',
+    'user:recent.offline_buy_with_coupon.count',
+    'is_manjian',
+    'user:recent.offline.unique_coupon.count',
+    'user:history.offline_receive_coupon.man200.count',
+    'user:recent(offline_buy_with_coupon.count/offline_buy_with_coupon.unique_merchant.count)',
+    'merchant:longago.offline_buy_with_coupon.distance.max',
+    'user:recent(online_buy_with_coupon.count/online_receive_coupon.count)',
+    'is_dazhe',
+    'user:history.offline.unique_coupon.count',
+    'user_merchant:recent.offline_buy_with_coupon.count',
+    'user:longago.offline_buy_with_coupon.timedelta.max',
+    'user:recent.offline_buy_with_coupon.discount_rate.min',
+    'user:longago.offline_buy_with_coupon.discount_rate.min',
+    'user:history.offline_buy_with_coupon.discount_rate.mean',
+    'user:longago.offline.unique_coupon.count',
+    'user:longago.offline_buy_with_coupon.discount_rate.mean',
+    'coupon:longago(offline_buy_with_coupon.count/offline_receive_coupon.count)',
+    'coupon:history.offline_buy_with_coupon.timedelta.mean',
+    'user:history(online_buy_with_coupon.count/online_receive_coupon.count)',
+    'user:longago(offline_buy_with_coupon.count/offline_buy_with_coupon.unique_merchant.count)',
+    'merchant:future.offline_receive_coupon.unique_coupon.count',
+    'user:history.offline_buy_with_coupon.count',
+    'user:history(offline_buy_with_coupon.count/offline_buy_with_coupon.unique_merchant.count)',
+    'user:history.offline_buy_with_coupon.discount_rate.min',
+    'user_merchant:longago(offline_buy_with_coupon.count/offline_receive_coupon.count)',
+    'user:longago.offline_buy_with_coupon.discount_rate.max',
+    'merchant:longago.offline_buy_with_coupon.distance.min',
+    'coupon:longago.offline_buy_with_coupon.distance.mean',
+    'user:recent(offline_buy_with_coupon.unique_merchant.count/offline.unique_merchant.count)',
+    'coupon:recent.offline_buy_with_coupon.distance.max',
+    'coupon:longago.offline_buy_with_coupon.timedelta.mean',
+    'user_merchant:history(offline_buy_with_coupon.count/offline_receive_coupon.count)',
+    'user:history.offline_buy_with_coupon.discount_rate.max',
+    'user:history.online_buy_with_coupon.count',
+    'user_merchant:longago.offline_receive_coupon.count',
+    'coupon:history.offline_buy_with_coupon.unique_user.count',
+    'merchant:longago.offline.unique_hotcoupon.count',
+    'user:history(offline_buy_with_coupon.unique_merchant.count/offline.unique_merchant.count)',
+    'user:longago(offline_buy_with_coupon.man200.count/offline_receive_coupon.man200.count)',
+    'merchant:history.offline_buy_with_coupon.distance.min',
+    'merchant:longago.offline.unique_coupon.count',
+    'coupon:recent.offline_receive_coupon.distance.min',
+    'user:longago(offline_buy_with_coupon.unique_merchant.count/offline.unique_merchant.count)',
+    'merchant:recent.offline.unique_coupon.count',
+    'user:history.offline_buy_with_coupon.unique_merchant.count',
+    'user:history.offline_buy_with_coupon.distance.max',
+    'user:recent.offline_buy_with_coupon.distance.min',
+    'coupon:longago.offline_buy_with_coupon.unique_user.count',
+    'user:longago.offline_buy_with_coupon.count',
+    'merchant:history.offline.unique_hotcoupon.count',
+    'user:recent.offline_buy_with_coupon.distance.max',
+    'user:recent.offline_buy_with_coupon.distance.mean',
+    'user:history.offline_buy_with_coupon.man200.count',
+    'user:longago.offline_buy_with_coupon.distance.max',
+    'user:history.offline_buy_with_coupon.distance.min',
+    'user:history.offline_buy_with_coupon.distance.mean',
+    'user:longago.offline_buy_with_coupon.distance.mean',
+    'merchant:recent.offline.unique_hotcoupon.count',
+    'coupon:longago.offline_buy_with_coupon.count',
+    'merchant:history.offline.unique_coupon.count',
+    'user:recent(offline_buy_with_coupon.unique_coupon.count/offline.unique_coupon.count)',
+    'coupon:history.offline_buy_with_coupon.distance.mean',
+    'coupon:recent.offline_buy_with_coupon.distance.min',
+    'coupon:longago.offline_buy_with_coupon.distance.max',
+    'coupon:history.offline_receive_coupon.distance.max',
+    'coupon:longago.offline_receive_coupon.distance.max',
+    'user:longago.offline_buy_with_coupon.unique_merchant.count',
+    'coupon:history.offline_buy_with_coupon.distance.min',
+    'user:recent.offline_buy_with_coupon.unique_merchant.count',
+    'user:history.offline_buy_with_coupon.unique_coupon.count',
+    'user_merchant:longago.offline_buy_with_coupon.count',
+    'coupon:history.offline_buy_with_coupon.distance.max',
+    'user:recent.offline_buy_with_coupon.unique_coupon.count',
+    'user:longago.offline_buy_with_coupon.distance.min',
+    'coupon:longago.offline_receive_coupon.distance.min',
+    'user:longago(offline_buy_with_coupon.unique_coupon.count/offline.unique_coupon.count)',
+    'user:history(offline_buy_with_coupon.unique_coupon.count/offline.unique_coupon.count)',
+    'coupon:longago.offline_buy_with_coupon.distance.min',
+    'user:longago.offline_buy_with_coupon.unique_coupon.count',
+    'user:longago(offline_buy_with_coupon.man200.count/offline_buy_with_coupon.count)',
+    'coupon:history.offline_receive_coupon.distance.min',
+    'user:history(offline_buy_with_coupon.man200.count/offline_receive_coupon.man200.count)',
+    'user:longago.offline_buy_with_coupon.man200.count',
+    'user:recent(offline_buy_with_coupon.man200.count/offline_buy_with_coupon.count)',
+    'user:recent.offline_buy_with_coupon.man200.count',
+    'user:history(offline_buy_with_coupon.man200.count/offline_buy_with_coupon.count)',
+    'user:recent(offline_buy_with_coupon.man200.count/offline_receive_coupon.man200.count)',
+    'is_xianshi',
+    'merchant:today.offline_receive_coupon.unique_coupon.count'
+]
 
 
 def read_dataset():
-    df_1 = pd.read_msgpack('data/z4_merge_1.msgpack')
-    df_1.info()
-    print('-' * 60)
-
-    df_2 = pd.read_msgpack('data/z4_merge_2.msgpack')
-    df_2.info()
-    print('-' * 60)
-
-    df_3 = pd.read_msgpack('data/z4_merge_3.msgpack')
-    df_3.info()
-    print('-' * 60)
-
-    df_raw_test = pd.read_msgpack('data/z1_raw_test.msgpack')
-    df_submit = df_raw_test[['user_id', 'coupon_id', 'date_received']].copy()
-    df_submit['date_received'] = df_submit.date_received.dt.strftime('%Y%m%d')
-    df_submit.info()
-    print('-' * 60)
-
-    df_train = pd.concat([df_1, df_2])
-    # df_train = df_1
-    df_validate = df_2
-    df_test = df_3
-
-    df_train_x, df_train_y = split_feature_label(df_train)
-    best_features = select_best_features(df_train_x, df_train_y)
-    LOG.info('best {} features:\n{}', len(best_features), pretty(best_features))
-
-    df_train_x_best = df_train_x[best_features]
-
-    df_validate_x, df_validate_y = split_feature_label(df_validate)
-    df_validate_x_best = df_validate_x[best_features]
-
-    df_test_x_best = df_test[best_features]
-
-    pca = ScalerPCA(n_components=0.95)
-    LOG.info('fit PCA, num features={}', len(best_features))
-    pca.fit(df_train_x_best, df_train_y)
-    LOG.info('n_components={}', pca.n_components_)
-    df_train_x_best = pca.transform(df_train_x_best)
-    df_validate_x_best = pca.transform(df_validate_x_best)
-    df_test_x_best = pca.transform(df_test_x_best)
-
-    return df_train_x_best, df_train_y, df_validate_x_best, df_validate_y, df_test_x_best, df_submit
-
-
-def read_dataset_ts():
     df_test = pd.read_msgpack('data/z6_ts_merged_test.msgpack')
-    with_date_feature(df_test)
     df_test_full = pd.read_msgpack('data/z6_ts_merged_test_full.msgpack')
-    features = list(df_test.columns.difference(['date']))
+    features = list(df_test.columns.difference(['date', 'label']))
+    features = [x for x in features if 'future' not in x and 'today' not in x]
+    # features = [x for x in features if ':' not in x]
+    # features = [x for x in features if 'offline' not in x]
+    # features = [x for x in features if 'user:' not in x]
+    # features = [x for x in features if 'merchant:' not in x]
+    # features = [x for x in features if 'coupon:' not in x]
+    # features = [x for x in features if 'user_merchant:' not in x]
+    user_features = [x for x in FEATURE_TOP[:200] if 'user:' in x]
+    features = list(sorted(set(user_features) | set(FEATURE_TOP[:80])))
     print(pretty(features))
     df_test = df_test[features]
-    df_submit = df_test_full[['user_id', 'coupon_id', 'date']].copy()
+    cols = ['user_id', 'coupon_id', 'date']
+    if TEST_HAS_LABEL:
+        cols += ['label']
+    df_submit = df_test_full[cols].copy()
     df_submit['date'] = df_submit.date.dt.strftime('%Y%m%d')
     LOG.info('df_test {}', df_test.shape)
     LOG.info('df_submit {}', df_submit.shape)
 
+    submit_cols = ['user_id', 'coupon_id', 'date', 'label']
     df_train = pd.read_msgpack('data/z6_ts_merged_train.msgpack')
-    with_date_feature(df_train)
     df_train_full = pd.read_msgpack('data/z6_ts_merged_train_full.msgpack')
-    df_validate = df_train.loc[(df_train['date'] >= '2016-05-01') &
-                               (df_train['date'] < '2016-06-01'), features + ['label']]
-    df_train = df_train.loc[df_train['date'] < '2016-06-01', features + ['label']]
-    df_validate_submit = df_train_full.loc[
-        (df_train_full['date'] >= '2016-05-01') & (df_train_full['date'] < '2016-06-01'), [
-            'user_id', 'coupon_id', 'date', 'label'
-        ]].copy()
-    df_train_submit = df_train_full.loc[
-        (df_train_full['date'] < '2016-06-01'), [
-            'user_id', 'coupon_id', 'date', 'label'
-        ]].copy()
+    mask = np.random.rand(len(df_train)) < 0.05
+
+    df_validate = df_train.loc[mask, features + ['label']]
+    df_validate_submit = df_train_full.loc[mask, submit_cols].copy()
     df_validate_submit['date'] = df_validate_submit.date.dt.strftime('%Y%m%d')
+
+    df_train = df_train.loc[~mask, features + ['label']]
+    df_train_submit = df_train_full.loc[~mask, submit_cols].copy()
     df_train_submit['date'] = df_train_submit.date.dt.strftime('%Y%m%d')
     LOG.info('df_train {}', df_train.shape)
     LOG.info('df_train_submit {}', df_train_submit.shape)
@@ -181,21 +354,29 @@ def read_dataset_ts():
     df_submit,
     df_validate_submit,
     df_train_submit,
-) = read_dataset_ts()
+) = read_dataset()
 SUBMIT_NAME = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
 
 
 def lgb_predict():
     params = {
+        # 'boosting': 'dart',
         'objective': 'binary',
         'metric': 'auc',
-        'is_unbalance': True,
-        'max_depth': 5,
-        'max_leaves': 127,
-        'lambda_l1': 1,
-        'lambda_l2': 10,
+        # 'is_unbalance': True,
+        'max_depth': 12,
+        'max_leaves': 16,
+        # 'max_bin': 63,
+        # 'min_data_in_leaf': 50,
+        'feature_fraction': 0.2,
+        'scale_pos_weight': 2,
+        # 'lambda_l1': 10,
+        # 'lambda_l2': 0.1,
         'eta': 0.01,
+        # 'zero_as_missing': True,
         'num_threads': 6,
+        'num_trees': 5000,
+        'early_stopping_round': 100,
     }
     dataset_train = lgb.Dataset(df_train_x_best, label=df_train_y)
     dataset_validate = lgb.Dataset(df_validate_x_best, label=df_validate_y)
@@ -203,7 +384,7 @@ def lgb_predict():
     valid_names = ['train', 'validate']
 
     LOG.info('train begin')
-    model = lgb.train(params, dataset_train, num_boost_round=1000,
+    model = lgb.train(params, dataset_train, verbose_eval=20,
                       valid_sets=valid_sets, valid_names=valid_names)
     LOG.info('train end')
     model.save_model(f'data/model-lgb-{SUBMIT_NAME}.dat')
@@ -221,7 +402,8 @@ def xgb_predict():
         'eval_metric': 'auc',
         'gamma': 0.1,
         'min_child_weight': 1.1,
-        'max_depth': 5,
+        'max_depth': 12,
+        'max_leaves': 128,
         'lambda': 10,
         'subsample': 0.7,
         'colsample_bytree': 0.7,
@@ -231,6 +413,7 @@ def xgb_predict():
         'seed': 0,
         'nthread': 4,
         'verbosity': 0,
+        'metric_freq': 100,
     }
     dataset_train = xgb.DMatrix(df_train_x_best, label=df_train_y)
     dataset_validate = xgb.DMatrix(df_validate_x_best, label=df_validate_y)
@@ -262,26 +445,21 @@ def main():
         train_submit_path = f'data/submit-lgb-train-{SUBMIT_NAME}.csv'
         test_label, validate_label, train_label = lgb_predict()
 
-    test_label_prob = MinMaxScaler()\
-        .fit_transform(test_label.reshape(-1, 1))\
-        .reshape(-1)
-    df_submit['prob'] = test_label_prob
+    df_submit['prob'] = test_label
     LOG.info('save result {}', submit_path)
     df_submit.to_csv(submit_path, index=False, header=False)
+    if TEST_HAS_LABEL:
+        print('test o2o auc: {:.3f}'.format(o2o_auc_score(df_submit)))
 
-    validate_label_prob = MinMaxScaler()\
-        .fit_transform(validate_label.reshape(-1, 1))\
-        .reshape(-1)
-    df_validate_submit['prob'] = validate_label_prob
-    LOG.info('save validate result {}', validate_submit_path)
-    df_validate_submit.to_csv(validate_submit_path, index=False, header=False)
-
-    train_label_prob = MinMaxScaler()\
-        .fit_transform(train_label.reshape(-1, 1))\
-        .reshape(-1)
-    df_train_submit['prob'] = train_label_prob
+    df_train_submit['prob'] = train_label
     LOG.info('save train result {}', train_submit_path)
     df_train_submit.to_csv(train_submit_path, index=False, header=False)
+    print('train o2o auc: {:.3f}'.format(o2o_auc_score(df_train_submit)))
+
+    df_validate_submit['prob'] = validate_label
+    LOG.info('save validate result {}', validate_submit_path)
+    df_validate_submit.to_csv(validate_submit_path, index=False, header=False)
+    print('validate o2o auc: {:.3f}'.format(o2o_auc_score(df_validate_submit)))
 
 
 if __name__ == "__main__":
