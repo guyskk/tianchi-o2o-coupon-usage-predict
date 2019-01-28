@@ -33,6 +33,7 @@ def with_discount(df, df_discount):
 
 
 class ValidateSplit:
+    name = 'validate'
     feature_begin = '2016-01-01'
     feature_end = '2016-04-30'
     train_begin = '2016-03-16'
@@ -43,6 +44,7 @@ class ValidateSplit:
 
 
 class TestSplit:
+    name = 'test'
     feature_begin = '2016-01-01'
     feature_end = '2016-06-15'
     train_begin = '2016-03-16'
@@ -270,11 +272,11 @@ class O2OEvents:
         events.feed_test(df_raw_test)
         LOG.info('events to_frame')
         df = events.to_frame(split)
-        df.to_msgpack('data/z6_ts_events.msgpack')
+        df.to_msgpack(f'data/z6_ts_{split.name}_events.msgpack')
 
         LOG.info('build_discount_table')
         df_discount = cls.build_discount_table(df)
-        df_discount.to_msgpack('data/z6_ts_discount.msgpack')
+        df_discount.to_msgpack(f'data/z6_ts_{split.name}_discount.msgpack')
 
         df_offline_events = df[
             df['event_type'].isin([
@@ -285,16 +287,16 @@ class O2OEvents:
         ]
         LOG.info('build_index_of user_id')
         user_id_index = cls.build_index_of(df_offline_events, 'user_id')
-        np.save('data/z6_ts_user_id.npy', user_id_index)
+        np.save(f'data/z6_ts_{split.name}_user_id.npy', user_id_index)
 
         for key in ['merchant_id', 'coupon_id']:
             LOG.info('build_index_of {}', key)
             arr = cls.build_index_of(df_offline_events, key)
-            np.save('data/z6_ts_{}.npy'.format(key), arr)
+            np.save('data/z6_ts_{}_{}.npy'.format(split.name, key), arr)
 
         LOG.info('build_index_of user_id_merchant_id')
         arr = cls.build_index_of(df_offline_events, ['user_id', 'merchant_id'])
-        np.save('data/z6_ts_user_id_merchant_id.npy', arr)
+        np.save(f'data/z6_ts_{split.name}_user_id_merchant_id.npy', arr)
 
 
 class IndexedEvents:
@@ -964,6 +966,13 @@ recent(online_receive_coupon.count / online_click.count)
 recent(online_buy_with_coupon.count / online_receive_coupon.count)
 """
 UserFeatureExtractor = FeatureExtractor(USER_FEATURE)
+
+
+@feature
+class UserFeature:
+    name = 'user'
+    key_column = 'user_id'
+    definition = USER_FEATURE
 
 
 class UserFeature(BaseFeature):
